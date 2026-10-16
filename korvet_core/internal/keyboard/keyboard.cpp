@@ -60,7 +60,7 @@ void Keyboard::clear_all() {
     }
 }
 
-// KEYBOARD_Read как в original/keyboard.c:
+// Опрос матрицы (адресная линия → маска строк):
 //   if (Addr & 0x100) Line = 8;
 //   for each bit 0..7 of addr: Value |= ChkMattrixLine(Line); Line++;
 // ChkMattrixLine(N) проверяет столбец N, возвращает маску строк 0..7
@@ -90,7 +90,7 @@ uint8_t Keyboard::read(uint16_t addr) const {
     return value;
 }
 
-// ChkMattrixLine(N) как в original/keyboard.c:
+// chk_matrix_line(N):
 //   Value = 0;
 //   Value |= KeyAlias[KBD[0][N]] ? 0x01 : 0;
 //   Value |= KeyAlias[KBD[1][N]] ? 0x02 : 0;

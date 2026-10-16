@@ -17,6 +17,8 @@
 
 namespace korvet {
 
+class Pic;
+
 // Один готовый (уже "напечатанный") байт от эмулируемого принтера.
 // Хост сам решает, что с ним делать: копить в TXT, рендерить в PDF,
 // слать на физический принтер и т.д. — korvet_core файлов не открывает.
@@ -66,7 +68,11 @@ public:
      * решает сам, буферизовать это или писать сразу.
      */
     void set_output_callback(PrinterByteCallback cb) { output_cb_ = std::move(cb); }
-    
+
+    /// Подключить PIC — для LSTINT (IRQ6): прерывание готовности
+    /// принтера по концу занятости (сигнал BUSYP, уровень 6).
+    void set_pic(Pic* pic) { pic_ = pic; }
+
     void set_enabled(bool enabled);
     bool is_enabled() const { return enabled_; }
     
@@ -97,6 +103,8 @@ private:
     int status_delay_counter_;   ///< Счетчик задержки статуса
     bool prev_strobe_state_;     ///< Предыдущее состояние строба
     uint32_t printed_bytes_count_; ///< Количество напечатанных байтов
+    bool disabled_warned_ = false; ///< Уже предупредили о потере байтов
+    Pic* pic_ = nullptr;         ///< PIC для LSTINT (IRQ6)
     
     /**
      * @brief Отправить готовый байт наружу через output_cb_

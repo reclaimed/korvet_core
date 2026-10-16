@@ -19,6 +19,7 @@ void Pic::reset() {
 
     icw_load_active_ = false;
     icw_load_step_ = 0;
+    icw_cascade_ = false;
     
     ocw3_ = 0;
     
@@ -43,7 +44,7 @@ void Pic::lower_irq(uint8_t irq) {
 
 uint8_t Pic::find_highest_priority_irq(uint8_t mask) const {
     // Циклический приоритет: начинаем с (low_priority_ + 1) & 7
-    // Как эталонный FindMaxBit_Ini() с picLowINT
+    // Циклический приоритет от младшего (эквивалент FindMaxBit с picLowINT)
     uint8_t irq = (low_priority_ + 1) & 0x07;
     for (int i = 0; i < 8; i++) {
         if (mask & (1 << irq)) return irq;
@@ -60,28 +61,28 @@ void Pic::write(uint8_t port, uint8_t data) {
     if ((port & 1) == 0) {
         // A0 = 0
         if (data & 0x10) {
-            // ICW1 — команда инициализации
+            // ICW1 — команда инициализации. Автомат последовательности ICW:
+            //   следующий байт A0=1 — ВСЕГДА ICW2 (база векторов);
+            //   при SNGL=0 (бит 1 сброшен) за ним ожидается ещё ICW3
+            //   (конфигурация каскада — поглощается).
+            // После завершения последовательности все дальнейшие записи
+            // A0=1 идут в OCW1 (IMR) — в том числе байт ICW4:
+            // зафиксированное поведение, воспроизводим его сознательно.
+            // I-2: раньше SNGL=0 зависал в шаге ICW2 — cascade-инициализация
+            // ломала маскирование прерываний; SNGL=1 наоборот терял ICW2
+            // (база векторов оставалась 0000H — прерывание уводило
+            // процессор в мусорный вектор).
             icw1_ = data;
             icw_load_active_ = true;
+            icw_cascade_ = (data & 0x02) == 0;  // SNGL=0 — ждём ICW3 после ICW2
+            icw_load_step_ = 1;                 // следующий байт — ICW2
 
-            // Сброс состояния (как в эталоне)
+            // Сброс состояния при ICW1
             low_priority_ = 7;
             poll_command_ = false;
             special_mask_mode_ = false;
             imr_ = 0;
             isr_ = 0;
-
-            // ФИКС A3: оригинал (pic.c:143) использует каскад для защиты ICW4.
-            // icw1_ & 0x01 = ICW4 нужна — устанавливаем icw_load_step_=1 (один доп. байт).
-            // В нашей single-mode без этого байт ICW4 пишется в IMR и маскирует IRQ.
-            if (!(data & 0x02)) icw_load_step_ = 2;  // SNGL=0: multi-controller mode
-            if (data & 0x01) {
-                // нужен ICW4
-                if (icw_load_step_ != 2) {
-                    icw_load_step_ = 1;  // ожидаем один байт ICW4 после ICW2
-                }
-            }
-
         } else if (data & 0x08) {
             // OCW3
             if (data & 0x40) {
@@ -144,37 +145,24 @@ void Pic::write(uint8_t port, uint8_t data) {
         }
 
     } else {
-        // A0 = 1 — как case 1 эталонного PIC_Write
+        // A0 = 1 — последовательность ICW (пока активна) либо OCW1 (IMR)
         if (icw_load_active_) {
-            if (icw_load_step_ == 2) {
-                icw2_ = data;           // ICW2 — vector base high byte
-            } else if (icw_load_step_ == 1) {
-                // ФИКС A3: может быть ICW3 (cascade) ИЛИ ICW4 (single + ICW4 needed).
-                // Смотрим icw1_ & 0x02 (SNGL) и icw1_ & 0x01 (ICW4 нужна).
-                if (icw1_ & 0x02) {
-                    // Single controller mode: ICW4 ожидается
-                    if (icw1_ & 0x01) {
-                        icw4_ = data;     // ICW4 — environment
-                        icw_load_active_ = false;
-                        icw_load_step_ = 0;
-                    } else {
-                        icw_load_active_ = false; // ICW3 не ожидается
-                        icw_load_step_ = 0;
-                    }
+            // I-2: первый байт последовательности — ВСЕГДА ICW2 (база
+            // векторов прерываний); второй (только при SNGL=0) — ICW3,
+            // который поглощается. Автомат не зависает ни в single-,
+            // ни в cascade-режиме и не теряет ICW2.
+            if (icw_load_step_ == 1) {
+                icw2_ = data;                     // ICW2 — база векторов
+                if (icw_cascade_) {
+                    icw_load_step_ = 2;           // ждём ICW3
                 } else {
-                    icw_load_active_ = false;     // ICW3 — slave configuration (consumed)
+                    icw_load_active_ = false;     // single — готово
                     icw_load_step_ = 0;
                 }
             } else {
-                // ФИКС A3: ICW2 в single mode. Если ICW4 нужна, остаёмся в icw_load_active_.
-                icw2_ = data;
-                if (icw1_ & 0x01) {
-                    // ожидается ICW4: остаёмся в режиме программирования
-                    icw_load_step_ = 1;
-                } else {
-                    icw_load_active_ = false;
-                    icw_load_step_ = 0;
-                }
+                icw3_ = data;                     // ICW3 — конфигурация каскада (поглощается)
+                icw_load_active_ = false;
+                icw_load_step_ = 0;
             }
         } else {
             // OCW1 — регистр масок прерываний (IMR)
@@ -211,7 +199,7 @@ uint8_t Pic::read(uint8_t port) {
 bool Pic::has_pending_interrupt(uint8_t* vector) {
     if (vector == nullptr) return false;
     
-    // Как эталонный DoPIC/CheckPIC: ищем старший в (IRR & ~IMR) | ISR
+    // Поиск старшего запроса в (IRR & ~IMR) | ISR
     uint8_t combined = (irr_ & ~imr_) | isr_;
     uint8_t irq = find_highest_priority_irq(combined);
     if (irq >= 8) return false;
@@ -225,7 +213,7 @@ bool Pic::has_pending_interrupt(uint8_t* vector) {
 }
 
 uint16_t Pic::acknowledge_interrupt() {
-    // Как эталонный DoPIC():
+    // Подтверждение прерывания (модель DoPIC):
     //   i = FindMaxBit(IRR & ~IMR | ISR);
     //   if ((i == 8) || (i == FindMaxBit(ISR))) return -1;
     //   IRR &= ~(1<<i); ISR |= 1<<i;

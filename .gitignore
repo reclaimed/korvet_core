@@ -1,9 +1,22 @@
+# Build dirs
+build/
 build*/
 cmake-build-*/
 out/
+
+# Objects and libs
 *.o
 *.a
 *.so
+*.dylib
+*.dll
+
+# Tooling
 compile_commands.json
 .cache/
 .vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc

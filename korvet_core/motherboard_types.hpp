@@ -11,12 +11,30 @@ struct mb_config_t {
     // Системная конфигурация
     bool fdc_enabled;
     uint8_t gzu_pages;
-    uint8_t lan_addr;
+    /// Адрес рабочего места ЛВС (1-15; 0 — групповой). Задаётся
+    /// «перемычками» платы, читается гостем через LANADR (PPI1-A биты
+    /// 4-7). По умолчанию — 1.
+    uint8_t lan_addr = 1;
+
+    // Источник тактирования канала 2 таймера (TMRINT/IRQ5) — см.
+    // mb_timer_ch2_clock_t. Источники противоречат друг другу
+    // (описание элементов: 50 Гц; схема: HBL 65,6 мкс), поэтому выбор
+    // вынесен в конфигурацию. 0 = HBL (по схеме, по умолчанию).
+    int timer_ch2_clock = 0;
+
+    /// Адрес ячейки ОЗУ с флагом ЛАТ/РУС конкретной версии ПЗУ для
+    /// get_keyboard_language_layout(). 0xFFFF — хак выключен (метод
+    /// вернёт false). Зависит от версии прошивки (по умолчанию 0xF72E —
+    /// ПЗУ 2.0; см. docs/MOTHERBOARD_API.md).
+    uint16_t kbd_lang_flag_addr = 0xF72E;
 
     // Настройки эмуляции
     int emulation_speed;  // 1-100 percentage, -1 for max speed
     bool sound_enabled;
-    int sound_volume;     // Volume level 0-100
+    /// Громкость хостового микшера, 0-100 (по умолчанию 100 — как у
+    /// реальной машины; влияет ТОЛЬКО на масштабирование сэмплов Audio,
+    /// не на эмулируемый гейт динамика, см. S-3).
+    int sound_volume = 100;
     int sound_sample_rate; // Audio sample rate (e.g., 22050, 44100)
     int sound_frequency;  // Audio frequency
     int sound_bit_depth;  // Audio bit depth (typically 8, 16)

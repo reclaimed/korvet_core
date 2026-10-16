@@ -8,16 +8,10 @@
 #include "../joystick/joystick.hpp"
 #include "../serial/serial.hpp"
 #include "../lan/lan.hpp"
+#include "../tape/tape.hpp"
 
 namespace korvet
 {
-
-    // Форварды внешних компонентов (глобальные экземпляры Motherboard)
-    extern Printer *printer_instance;   // This would be connected externally
-    extern Mouse *mouse_instance;       // This would be connected externally
-    extern Joystick *joystick_instance; // This would be connected externally
-    extern Serial *serial_instance;     // This would be connected externally
-    extern Lan *lan_instance;           // This would be connected externally
 
     void Ppi::init()
     {
@@ -27,47 +21,9 @@ namespace korvet
     void Ppi::reset()
     {
         // Инициализация всех трёх PPI (КР580ВВ55)
-        ppi1_.port_a.data = 0;
-        ppi1_.port_a.direction = 0; // Assume output by default
-        ppi1_.port_a.control = 0;
-
-        ppi1_.port_b.data = 0;
-        ppi1_.port_b.direction = 0;
-        ppi1_.port_b.control = 0;
-
-        ppi1_.port_c.data = 0;
-        ppi1_.port_c.direction = 0;
-        ppi1_.port_c.control = 0;
-
-        ppi1_.control = 0;
-
-        ppi2_.port_a.data = 0;
-        ppi2_.port_a.direction = 0;
-        ppi2_.port_a.control = 0;
-
-        ppi2_.port_b.data = 0;
-        ppi2_.port_b.direction = 0;
-        ppi2_.port_b.control = 0;
-
-        ppi2_.port_c.data = 0;
-        ppi2_.port_c.direction = 0;
-        ppi2_.port_c.control = 0;
-
-        ppi2_.control = 0;
-
-        ppi3_.port_a.data = 0;
-        ppi3_.port_a.direction = 0;
-        ppi3_.port_a.control = 0;
-
-        ppi3_.port_b.data = 0;
-        ppi3_.port_b.direction = 0;
-        ppi3_.port_b.control = 0;
-
-        ppi3_.port_c.data = 0;
-        ppi3_.port_c.direction = 0;
-        ppi3_.port_c.control = 0;
-
-        ppi3_.control = 0;
+        ppi1_ = ppi_chip_t{};
+        ppi2_ = ppi_chip_t{};
+        ppi3_ = ppi_chip_t{};
 
         ppi1_ctrl_word_ = 0;
         ppi2_ctrl_word_ = 0;
@@ -84,7 +40,10 @@ namespace korvet
             timer_->set_sound_enable(false);
         }
 
-        // Инициализация связей
+        // Детекторы фронтов кассеты/мыши — в исходное состояние
+        prev_casout_ = 0;
+        prev_stop_relay_ = false;
+        prev_mouse_init_ = false;
     }
 
     uint8_t Ppi::read_port(uint8_t ppi_num, uint8_t port)
@@ -121,7 +80,7 @@ namespace korvet
             switch (port & 0x03)
             {
             case 0:
-                return ppi3_.port_a.data;
+                return read_ppi3_a();
             case 1:
                 return read_ppi3_b();
             case 2:
@@ -149,11 +108,9 @@ namespace korvet
             switch (port & 0x03)
             {
             case 0:
-                // ФИКС C3: логируем запись в PPI1-A (важные системные флаги).
                 ppi1_.port_a.data = data;
                 break;
             case 1:
-                // ФИКС C3: логируем запись в PPI1-B (DRVREG). Увидим ВСЕ записи в FDC.
                 ppi1_.port_b.data = data;
                 write_drive_reg(data);
                 break;
@@ -178,8 +135,8 @@ namespace korvet
                     {
                         oldc &= bit ^ 0xff;
                     }
-                    disassemble_vireg_ppi1_c(oldc);
-                    ppi1_.port_c.data = oldc;
+                    disassemble_vireg_ppi1_c(static_cast<uint8_t>(oldc));
+                    ppi1_.port_c.data = static_cast<uint8_t>(oldc);
                 }
                 break;
             }
@@ -190,9 +147,9 @@ namespace korvet
             case 0:
                 ppi2_.port_a.data = data;
                 // Запись в PPI2_A — это данные принтера (PPI2 порт A)
-                if (printer_instance)
+                if (printer_)
                 {
-                    printer_instance->write_data(data);
+                    printer_->write_data(data);
                 }
                 break;
             case 1:
@@ -212,11 +169,12 @@ namespace korvet
                     int bit = 1 << ((data & 0x0e) >> 1);
                     if (data & 1)
                     {
-                        ppi2_.port_c.data |= bit;
+                        ppi2_.port_c.data |= static_cast<uint8_t>(bit);
                     }
                     else
                     {
-                        ppi2_.port_c.data &= bit ^ 0xff;
+                        ppi2_.port_c.data = static_cast<uint8_t>(
+                            ppi2_.port_c.data & (bit ^ 0xff));
                     }
                 }
                 disassemble_ppi2_c(ppi2_.port_c.data);
@@ -231,11 +189,23 @@ namespace korvet
                 break;
             case 1:
                 ppi3_.port_b.data = data;
-                // PPI3_B — ввод джойстика/мыши
+                // PPI3_B — вход манипуляторов (чтение через read_ppi3_b)
                 break;
             case 2:
                 ppi3_.port_c.data = data;
-                // PPI3_C — выбор устройства чтения (мышь или джойстик)
+                // PPI3_C — управление ЭУ8040: бит 6 — выбор слота
+                // (0=ХР1/мышь, 1=ХР2/джойстик), бит 7 — «Разрешение»;
+                // бит 3 — сигнал «инициализация» мыши ММ8031 (фронт);
+                // бит 4 — линия «Синхр» (уровень, читается при опросе B).
+                if (mouse_)
+                {
+                    bool init_bit = (data & 0x08) != 0;
+                    if (init_bit && !prev_mouse_init_)
+                    {
+                        mouse_->mm8031_init_pulse();
+                    }
+                    prev_mouse_init_ = init_bit;
+                }
                 break;
             case 3:
                 if (data & 0x80)
@@ -247,11 +217,23 @@ namespace korvet
                     int bit = 1 << ((data & 0x0e) >> 1);
                     if (data & 1)
                     {
-                        ppi3_.port_c.data |= bit;
+                        ppi3_.port_c.data |= static_cast<uint8_t>(bit);
                     }
                     else
                     {
-                        ppi3_.port_c.data &= bit ^ 0xff;
+                        ppi3_.port_c.data = static_cast<uint8_t>(
+                            ppi3_.port_c.data & (bit ^ 0xff));
+                    }
+                    // BSR-запись отдельных битов C затрагивает и биты
+                    // управления ЭУ8040 — прогоняем через ту же логику
+                    if (mouse_)
+                    {
+                        bool init_bit = (ppi3_.port_c.data & 0x08) != 0;
+                        if (init_bit && !prev_mouse_init_)
+                        {
+                            mouse_->mm8031_init_pulse();
+                        }
+                        prev_mouse_init_ = init_bit;
                     }
                 }
                 break;
@@ -324,40 +306,73 @@ namespace korvet
 
     uint8_t Ppi::read_ppi2_c_raw() const
     {
-        return assemble_ppi2_c();
+        return static_cast<uint8_t>(assemble_ppi2_c());
     }
 
     // Специфичные функции PPI3
     uint8_t Ppi::read_ppi3_a() const
     {
-        return ppi3_.port_a.data;
+        // Порт A ППР№3: чтение зависит от направления, заданного словом
+        // режима (бит 4: 1 = ввод, 0 = вывод). В режиме ВЫВОДА чтение
+        // возвращает выходную защёлку (семантика КР580ВВ55) — именно так
+        // работает тест ПЗУ при включении (запись/считывание порта
+        // расширения как «проверка шины»). В режиме ВВОДА порт читает
+        // линии кнопок МД8030 (контакты 18-19 вилки ХР3 = Порт 0.4/0.5,
+        // биты 4-5, активный низкий) через мультиплексор ЭУ8040.
+        if ((ppi3_ctrl_word_ & 0x10) == 0) {
+            return ppi3_.port_a.data;  // вывод: защёлка
+        }
+        uint8_t pc = ppi3_.port_c.data;
+        if ((pc & 0x80) || !(pc & 0x40)) {
+            return 0xFF;  // «Разрешение»=1 или слот ХР1 — линии свободны
+        }
+        if (joystick_)
+        {
+            return joystick_->read_ppi3_port_a();
+        }
+        return 0xFF;
     }
 
     uint8_t Ppi::read_ppi3_b() const
     {
-        // Джойстик: берём экземпляр, если подключён
-        if (joystick_instance)
-        {
-            return joystick_instance->read_ppi3_port_b();
+        // Порт B ППР№3: аналогично — в режиме ВЫВОДА чтение возвращает
+        // защёлку; в режиме ВВОДА порт читает манипуляторы через
+        // мультиплексор ЭУ8040:
+        //   бит 7 (PPI3-C, «Разрешение»): 1 — сигналы манипуляторов НЕ
+        //     проходят на PPI3 (штекер «вынут») → порт читает 0xFF;
+        //   бит 6 (выбор манипулятора): 0 — слот ХР1 (мышь ММ8031),
+        //     1 — слот ХР2 (джойстик МД8030);
+        //   бит 4 («Синхр»): уровень линии синхронизации счётчиков ММ8031.
+        if ((ppi3_ctrl_word_ & 0x02) == 0) {
+            return ppi3_.port_b.data;  // вывод: защёлка
         }
-        // Фолбэк на оригинальную реализацию
-        return read_ppi3_b_raw();
+        uint8_t pc = ppi3_.port_c.data;
+        if (pc & 0x80)
+        {
+            return 0xFF;  // «Разрешение» = 1: устройство не подключено
+        }
+        if (pc & 0x40)
+        {
+            // Слот ХР2 — джойстик МД8030
+            if (joystick_)
+            {
+                return joystick_->read_ppi3_port_b();
+            }
+            return 0xFF;
+        }
+        // Слот ХР1 — параллельная мышь ММ8031 (активна в режиме
+        // mouse_set_mode(MOUSE_PARALLEL); в остальных режимах слот пуст)
+        if (mouse_ && mouse_->get_mode() == mb_mouse_mode_t::MOUSE_PARALLEL)
+        {
+            return mouse_->read_mm8031_port_b((pc & 0x10) != 0);
+        }
+        return 0xFF;
     }
 
     uint8_t Ppi::read_ppi3_b_raw() const
     {
-        // Мышь: берём экземпляр, если подключён
-        if (mouse_instance)
-        {
-            return mouse_instance->get_ppi3_port_b_value();
-        }
-        // Нет мыши — фолбэк на джойстик
-        if (joystick_instance)
-        {
-            return joystick_instance->read_ppi3_port_b();
-        }
-        // Фолбэк по умолчанию
-        return 0xFF;
+        // Прямое чтение порта B без мультиплексора ЭУ8040 (отладка)
+        return read_ppi3_b();
     }
 
     uint8_t Ppi::read_ppi3_c() const
@@ -380,132 +395,47 @@ namespace korvet
         ppi3_.port_c.data = value;
     }
 
-    // Вспомогательные функции (история реализаций assemble_ppi1_a)
-    // uint8_t Ppi::assemble_ppi1_a() const {
-    //     uint8_t value = 0;
-
-    //     // LAN address bits (4-7) - from LAN component
-    //     if (lan_instance) {
-    //         value |= (lan_instance->get_address() & 0x0F) << 4;
-    //     } else {
-    //         value |= 0x00;  // Default LAN address
-    //     }
-
-    //     // ACZU attribute read bit (3) - from video component
-    //     if (video_) {
-    //         value |= (video_->get_aczu_attr_read() & 0x01) << 3;
-    //     }
-
-    //     // Printer status bit (2) - from printer component
-    //     if (printer_instance) {
-    //         // Get printer status - 1 if ready, 0 if busy
-    //         value |= (printer_instance->read_status() & 0x01) << 2;
-    //     } else {
-    //         value |= 0x04;  // Default to ready state
-    //     }
-
-    //     // VBLANK bit (1) - from video component (Takt < VBLANK_TICKS)
-    //     if (video_ && frame_cycles_getter_) {
-    //         value |= (video_->is_in_vblank(frame_cycles_getter_()) ? 1 : 0) << 1;
-    //     }
-
-    //     // Cassette input bit (0) - from tape component
-    //     // Placeholder - would read actual cassette input state
-    //     value |= 0x00;
-
-    //     return value;
-    // }
-
-    // uint8_t Ppi::assemble_ppi1_a() const
-    // {
-    //     uint8_t value = 0;
-
-    //     // LAN address bits (4-7) - from LAN component
-    //     if (lan_instance)
-    //     {
-    //         value |= (lan_instance->get_address() & 0x0F) << 4;
-    //     }
-    //     else
-    //     {
-    //         value |= 0x00; // Default LAN address
-    //     }
-
-    //     // ACZU attribute read bit (3) - always 1 (FDC ready signal)
-    //     value |= 0x08;
-
-    //     // Printer status bit (2) - from printer component
-    //     if (printer_instance)
-    //     {
-    //         // Get printer status - 1 if ready, 0 if busy
-    //         value |= (printer_instance->read_status() & 0x01) << 2;
-    //     }
-    //     else
-    //     {
-    //         value |= 0x04; // Default to ready state
-    //     }
-
-    //     // VBLANK bit (1) - from video component (Takt < VBLANK_TICKS)
-    //     if (video_ && frame_cycles_getter_)
-    //     {
-    //         value |= (video_->is_in_vblank(frame_cycles_getter_()) ? 1 : 0) << 1;
-    //     }
-
-    //     // Cassette input bit (0) - from tape component
-    //     // Placeholder - would read actual cassette input state
-    //     value |= 0x00;
-
-    //     return value;
-    // }
-
     uint8_t Ppi::assemble_ppi1_a() const
     {
         uint8_t value = 0;
 
-        // Биты адреса LAN (4-7) — из компонента LAN
-        if (lan_instance)
+        // Биты адреса LAN (4-7) — из компонента LAN (LANADR, ADRMSK=0F0H)
+        if (lan_)
         {
-            value |= (lan_instance->get_address() & 0x0F) << 4;
-        }
-        else
-        {
-            value |= 0x00; // Default LAN address
+            value |= static_cast<uint8_t>((lan_->get_address() & 0x0F) << 4);
         }
 
-    // ACZU attribute bit (3) — VISTS: бит 0 переменной scr_Attr_Read (visst_),
-    // а НЕ флаг "был ли доступ к АЦЗУ". Эталон (ppi.c::Assemble_PPI1A):
-    //   Value|=(scr_Attr_Read & 0x01)<<3;
-    // scr_Attr_Read/visst_ обновляется в aczu_read() при scr_Attr_Write==3
-    // (режим ATRFRE) значением АТРИБУТНОГО байта, считанного из памяти —
-    // это НЕ булев "был ли доступ", а конкретное значение (обычно 0x00/0xFF).
-    // Раньше здесь стоял aczu_attr_written_ (bool "была запись/чтение"),
-    // что давало неверный бит и ломало self-test ПЗУ, ожидающий именно
-    // (scr_Attr_Read & 1).
-    if (video_)
-        value |= (video_->get_aczu_attr_read() & 0x01) << 3;
+        // Бит атрибута АЦЗУ (3) — VISTS: бит 0 переменной visst_,
+        // обновляемой при чтении АЦЗУ в режиме ATRFRE (режим 3).
+        if (video_)
+            value |= static_cast<uint8_t>((video_->get_aczu_attr_read() & 0x01) << 3);
 
-        // Бит статуса принтера (2) — из компонента принтера
-        if (printer_instance)
+        // Бит статуса принтера (2) — из компонента принтера (LSTRDY)
+        if (printer_)
         {
-            value |= (printer_instance->read_status() & 0x01) << 2;
+            value |= static_cast<uint8_t>((printer_->read_status() & 0x01) << 2);
         }
         else
         {
             value |= 0x04; // Default to ready state
         }
 
-        // VBLANK bit (1) — как в оригинале: Value|=((Takt<VBLANK_TICKS)?1:0)<<1
-        // Бит равен 1 только первые ~8170 тактов КАЖДОГО кадра (обратный ход луча),
-        // а не весь кадр целиком. БИОС опрашивает этот бит в цикле, ожидая его
-        // сброса в 0 (выход из обратного хода) — если бит держать в 1 весь кадр,
-        // ожидание никогда не завершается и эмулятор виснет в цикле опроса.
-        // Считаем динамически от текущего числа тактов в кадре, а не от статического
-        // флага, выставляемого в начале/конце run_frame().
+        // VBLANK бит (1) — равен 1 только первые ~8170 тактов КАЖДОГО
+        // кадра (обратный ход луча). БИОС опрашивает этот бит в цикле,
+        // ожидая его сброса в 0. Считаем динамически от текущего числа
+        // тактов в кадре.
         if (video_ && frame_cycles_getter_ && video_->is_in_vblank(frame_cycles_getter_()))
             value |= (1 << 1);
 
-        // Бит входа кассеты (0) — из компонента магнитофона
-        // Заглушка (реальный вход кассеты не подключён)
-        value |= 0x00;
+        // Бит входа кассеты (0) — CASIN: уровень входного сигнала
+        // адаптера магнитофона в момент опроса (T-1: раньше —
+        // константный 0, лента «молчала»). Гостевой загрузчик опрашивает
+        // бит в плотном цикле — ленивая модель времени по тактам CPU
+        // даёт достаточную точность (полупериоды ≥ 0,2 мс = 500 тактов).
+        if (tape_ && cycle_getter_)
+        {
+            value |= static_cast<uint8_t>(tape_->read_cas_level(cycle_getter_()) & 0x01);
+        }
 
         return value;
     }
@@ -525,11 +455,11 @@ namespace korvet
         if (video_)
         {
             // Восстанавливаем регистр из состояния видео
-            value |= (video_->get_gzu_read_page() & 0x03) << 6;           // scr_page_access
-            value |= (video_->get_aczu_attr_write() & 0x03) << 4;         // scr_attr_write
-            value |= (video_->get_aczu_wide_mode() ? 0x01 : 0x00) << 3;   // scr_wide_mode
-            value |= (video_->get_aczu_second_font() ? 0x01 : 0x00) << 2; // scr_second_font
-            value |= (video_->get_gzu_show_page() & 0x03) << 0;           // scr_page_show
+            value |= static_cast<uint8_t>((video_->get_gzu_read_page() & 0x03) << 6);           // страница доступа
+            value |= static_cast<uint8_t>((video_->get_aczu_attr_write() & 0x03) << 4);         // режим записи атрибута
+            value |= static_cast<uint8_t>((video_->get_aczu_wide_mode() ? 0x01 : 0x00) << 3);   // широкий режим
+            value |= static_cast<uint8_t>((video_->get_aczu_second_font() ? 0x01 : 0x00) << 2); // второй шрифт
+            value |= static_cast<uint8_t>((video_->get_gzu_show_page() & 0x03) << 0);           // страница отображения
         }
 
         return value;
@@ -537,7 +467,7 @@ namespace korvet
 
     void Ppi::disassemble_ppi2_c(int value)
     {
-        // Гейт звука: бит 3 управляет выводом звука
+        // Гейт звука: бит 3 (SNDEN) управляет выводом звука
         int new_sound_enable = (value & 0x08) >> 3;
 
         // Обновляем только при смене состояния гейта
@@ -551,83 +481,53 @@ namespace korvet
             }
         }
 
-        // Строб принтера (бит 5; в оригинале — SetPrinterStrobe)
-        // Эталон: SetPrinterStrobe((value & 0x20) >> 4);
-        // У нас: бит 5 = строб принтера
+        // Строб принтера (бит 5): печать — по НАРАСТАЮЩЕМУ фронту
         bool strobe_state = (value & 0x20) != 0;
-        if (printer_instance)
+        if (printer_)
         {
-            printer_instance->process_strobe(strobe_state);
+            printer_->process_strobe(strobe_state);
         }
 
-        // Остальные биты — управление кассетой
-        // Бит 2: мотор кассеты ВКЛ
-        // Биты 1,0: уровень выхода кассеты
+        // Адаптер магнитофона (T-1):
+        //   биты 1,0 — трёхуровневый выход CASOUT (SETLOW=00B,
+        //             SETMID=01B, SETHIGH=11B);
+        //   бит 2 — реле «кратковременного стопа» лентопротяжки.
+        if (tape_)
+        {
+            uint8_t casout_code = static_cast<uint8_t>(value & 0x03);
+            if (casout_code != prev_casout_)
+            {
+                prev_casout_ = casout_code;
+                uint64_t cycle = cycle_getter_ ? cycle_getter_() : 0;
+                tape_->on_casout_write(casout_code, cycle);
+            }
+
+            bool relay = (value & 0x04) != 0;
+            if (relay != prev_stop_relay_)
+            {
+                prev_stop_relay_ = relay;
+                uint64_t cycle = cycle_getter_ ? cycle_getter_() : 0;
+                tape_->set_stop_relay(relay, cycle);
+            }
+        }
     }
-
-    // int Ppi::assemble_ppi2_c() const {
-    //     int value = 0;
-    //     value |= (sound_enable_ & 0x01) << 3;
-    //     return value;
-    // }
-
-    // int Ppi::assemble_ppi2_c() const {
-    //     int value = 0;
-    //     // Бит 3: при чтении отражает готовность FDC (INTRQ),
-    //     // при записи управляет звуком (SOUND_ON).
-    //     if (fdc_ && fdc_->get_intrq())   // FDC сигнализирует о завершении операции
-    //         value |= 0x08;               // бит 3 = 1
-    //     else
-    //         value |= (sound_enable_ & 0x01) << 3;  // или просто состояние звука, если INTRQ=0
-    //     return value;
-    // }
-
-    // int Ppi::assemble_ppi2_c() const
-    // {
-    //     int value = 0;
-    //     // Бит 3: INTRQ от FDC (активный низкий? В original IntrqDrq=0xBF когда INTRQ=0,
-    //     // и 0x3F когда INTRQ=1. Значит, INTRQ=1 — это низкий уровень бита 6? Запутанно.
-    //     // Проще: всегда 1, так как FDC в покое.
-    //     value |= 0x08; // бит 3 всегда 1
-    //     return value;
-    // }
-
-    // int Ppi::assemble_ppi2_c() const
-    // {
-    //     // Бит 3 всегда 1 (INTRQ FDC), биты 2-0 — состояние звука/мотора
-    //     return 0x08; // всегда возвращаем готовность FDC
-    // }
-
-    // int Ppi::assemble_ppi2_c() const
-    // {
-    //     int value = 0;
-    //     // Бит 3: выход звукового канала таймера (меандр)
-    //     if (timer_)
-    //     {
-    //         value |= (timer_->get_output(0) ? 1 : 0) << 3;
-    //     }
-    //     return value;
-    // }
 
     int Ppi::assemble_ppi2_c() const
     {
-        int value = 0;
-        // Бит 3: SoundEnable (как в original/ppi.c: assemble_ppi2_c возвращает SoundEnable << 3)
-        // При чтении PPI2-C бит 3 отражает состояние звука, установленное при последней записи
-        if (sound_enable_)
-            value |= 0x08;
-        // Бит 0: выход звукового канала таймера (меандр)
-        if (timer_ && timer_->get_output(0))
-            value |= 0x01;
-        return value;
+        // X-1: чтение выходного порта C ППР№2 возвращает ЗАЩЁЛКУ —
+        // последнее записанное гостем значение (семантика КР580ВВ55:
+        // чтение выходного порта — чтение выходного регистра).
+        // Раньше сюда подмешивался бит 0 = выход канала 0 таймера,
+        // которого в защёлке порта нет.
+        return ppi2_.port_c.data;
     }
 
     uint8_t Ppi::read_joystick() const
     {
         // Состояние джойстика: берём экземпляр, если подключён
-        if (joystick_instance)
+        if (joystick_)
         {
-            return joystick_instance->read_ppi3_port_b();
+            return joystick_->read_ppi3_port_b();
         }
         // По умолчанию: кнопки не нажаты
         return 0xFF;

@@ -83,15 +83,20 @@ private:
     
     // Состояние LED клавиатуры (выбор раскладки)
 
-    Video* video_;
-    Fdc* fdc_;
-    Cpu* cpu_;
-    Ppi* ppi_;
-    Serial* serial_;
-    Lan* lan_;
-    Timer* timer_;
-    Keyboard* keyboard_;
-    Pic* pic_;
+    // Подключения компонентов (default-инициализаторы — W-7: раньше
+    // Memory::init() обнулял lan_ ПОСЛЕ connect_components() из-за
+    // порядка вызовов в Motherboard::init(), и маршрутизация портов
+    // 0x20/0x21 ЛВС была «мёртвой» для гостевого ПО — находка
+    // верификации гостевым кодом (periph_guest_test).
+    Video* video_ = nullptr;
+    Fdc* fdc_ = nullptr;
+    Cpu* cpu_ = nullptr;
+    Ppi* ppi_ = nullptr;
+    Serial* serial_ = nullptr;
+    Lan* lan_ = nullptr;
+    Timer* timer_ = nullptr;
+    Keyboard* keyboard_ = nullptr;
+    Pic* pic_ = nullptr;
     
     uint8_t map_address(uint16_t addr);
     void handle_peripheral_write(uint16_t addr, uint8_t data);

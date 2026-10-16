@@ -65,8 +65,7 @@ public:
     uint8_t get_ncreg() const { return ncreg_; }
     uint8_t get_vireg() const { return vireg_; }
     
-    // Хуки клавиатуры/системного регистра (для Memory)
-    uint8_t read_keyboard_port(uint16_t addr);
+    // Хук смены системного регистра (для Memory)
     void on_sysreg_change(uint8_t sysreg);
     
     // Состояние для отладки
@@ -98,8 +97,11 @@ public:
     void set_lut_write_protect(bool v) { lut_write_protect_ = v; }
     void force_all_screen_update() { full_redraw_pending_ = true; }
     
-    // Доступ к кадровому буферу (legacy API: сырой указатель на back-буфер)
-    uint8_t* get_framebuffer() { return framebuffer_.data(); }
+    // Доступ к кадровому буферу (legacy API): возвращает back-буфер —
+    // массив, в который render_frame() пишет последний отрендеренный кадр.
+    // Хост обязан вызывать рендер (Motherboard::render_video_frame())
+    // до чтения.
+    uint8_t* get_framebuffer() { return back_framebuffer_.data(); }
 
     // === Double-buffering API (zero-copy для GUI) ===
     // Перед рендерингом кадра видео работает с back_framebuffer_ (back).
@@ -174,13 +176,25 @@ private:
     bool aczu_write_protect_ = false;
     bool lut_write_protect_ = false;
     
-    // Шрифт
-    static constexpr uint16_t FONT_SIZE = 16 * 256 * 2;  // 16 bytes per char, 256 chars, 2 font sizes
+    // Шрифт: файл знакогенератора — ДВА набора символов по 4096 байт
+    // (основной + псевдографика; «в знакогенераторе находятся два
+    // набора символов» — схема, константа FONT1=4 в описании
+    // элементов). Широкий режим использует ТЖЕ байты через таблицу
+    // развёртки WEXPAND — отдельный буфер 16 КБ не нужен (RP2040).
+    static constexpr uint16_t FONT_SIZE = 16 * 256 * 2;  // 8192: 16 байт/символ × 256 × 2 набора
     std::array<uint8_t, FONT_SIZE> font_;
-    
+
+    // Развёртка ниббла для широкого режима: каждый бит дублируется
+    // (пиксель длится два такта пиксельной частоты при MODSEL).
+    // 16 байт вместо буфера широкого шрифта 16 КБ — экономия ОЗУ
+    // для RP2040; результат побитово идентичен поэтапной развёртке.
+    static constexpr uint8_t WEXPAND[16] = {
+        0x00, 0x03, 0x0C, 0x0F, 0x30, 0x33, 0x3C, 0x3F,
+        0xC0, 0xC3, 0xCC, 0xCF, 0xF0, 0xF3, 0xFC, 0xFF
+    };
+
     bool frame_modified_;
-    bool first_nonzero_frame_logged_;
-    uint8_t current_line_;
+    uint8_t current_line_;   ///< текущая линия развёртки (для отладки)
     
     // === Двойная буферизация кадра ===
     // back_framebuffer_ — пишется в render_frame() эмуляцией.
@@ -191,12 +205,9 @@ private:
     std::array<uint8_t, FRAMEBUFFER_SIZE> back_framebuffer_;
     std::shared_ptr<uint8_t[]> front_framebuffer_;
     std::shared_ptr<uint8_t[]> back_alloc_;       // аллоцированный back (на случай если GUI его ещё держит)
-    // Legacy API совместимость: get_framebuffer() возвращает back.
-    std::array<uint8_t, FRAMEBUFFER_SIZE> framebuffer_;
     
     // Обновление кадрового буфера ACZU
     void update_aczu_framebuffer();
-    void create_wide_font();
     
     // Флаги обновления строк развёртки
     std::array<bool, 256> line_update_flags_;

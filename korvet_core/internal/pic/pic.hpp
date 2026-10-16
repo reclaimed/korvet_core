@@ -34,7 +34,8 @@ private:
     uint8_t icw4_;
 
     bool icw_load_active_;          // Programming mode flag (matches original picPRG)
-    int icw_load_step_;         // Slave programming counter (matches original SlavePrg)
+    int icw_load_step_;         // 1 = ждём ICW2, 2 = ждём ICW3, 0 = не в init
+    bool icw_cascade_;          // SNGL=0: после ICW2 ожидается ICW3
     
     uint8_t ocw3_;
     

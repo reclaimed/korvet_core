@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(korvet_core VERSION 1.2.0 LANGUAGES CXX)
+project(korvet_core VERSION 0.3.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -101,4 +101,15 @@ if(KORVET_CORE_BUILD_EXAMPLES)
     add_executable(core_demo korvet_core/examples/core_demo.cpp)
     target_link_libraries(core_demo PRIVATE korvet_core)
     target_include_directories(core_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/i8080)
+endif()
+
+# --- Тесты (ctest): внутриядровые selftest'ы через minigui ---
+include(CTest)
+
+# --- minigui: консольный инструмент проверки ядра (headless + опция SDL2) ---
+# Скриншоты PNG/WAV-дампы/ввод по сценарию/selftest подсистем.
+# Полноценная проверка — запуск гостевого ПО (см. korvet_core/minigui/README.md).
+option(KORVET_CORE_BUILD_MINIGUI "Собрать minigui (CLI-проверка ядра)" ON)
+if(KORVET_CORE_BUILD_MINIGUI)
+    add_subdirectory(korvet_core/minigui)
 endif()

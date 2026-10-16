@@ -9,172 +9,57 @@ void Mouse::init() {
 }
 
 void Mouse::reset() {
-    delta_x_ = 0;
-    delta_y_ = 0;
-    buttons_ = 0;
-    
     accumulated_x_ = 0;
     accumulated_y_ = 0;
-    accumulate_ = true;
-    
-    max_delta_ = 127;  // Default maximum delta value
-    
-    mouse_system_enabled_ = false;
-    interface_mode_ = InterfaceMode::STANDARD;
-    current_packet_byte_ = 0;
-    prev_delta_x_ = 0;
-    prev_delta_y_ = 0;
+    buttons_ = 0;
+
+    max_delta_ = 127;  // клэмп посылки (±127, 1 байт со знаком)
+
+    // Режим подключения НЕ сбрасывается: это конфигурация «шнура»
+    // (что подключил пользователь), а не состояние гостя. По умолчанию —
+    // последовательная мышь на ИРПС (Microsoft-совместимая).
+
+    // ММ8031: счётчики приращений в исходное состояние 1000b
+    mm_cnt_x_ = 8;
+    mm_cnt_y_ = 8;
+
     prev_buttons_ = 0;
 }
 
 void Mouse::move(int16_t dx, int16_t dy) {
-    if (accumulate_) {
-        accumulated_x_ += dx;
-        accumulated_y_ += dy;
-    } else {
-        delta_x_ = dx;
-        delta_y_ = dy;
-        clamp_delta(delta_x_);
-        clamp_delta(delta_y_);
-    }
-}
+    switch (mode_) {
+        case mb_mouse_mode_t::MOUSE_SERIAL:
+            // Накопление между кадрами — посылка уходит раз в кадр
+            // (check_mouse), как кадровая модель ввода.
+            accumulated_x_ += dx;
+            accumulated_y_ += dy;
+            break;
 
-void Mouse::set_position(int16_t x, int16_t y) {
-    // Для абсолютного позиционирования нужно хранить абсолютные координаты
-    // Пока — просто сброс дельт
-    delta_x_ = 0;
-    delta_y_ = 0;
-    accumulated_x_ = 0;
-    accumulated_y_ = 0;
+        case mb_mouse_mode_t::MOUSE_PARALLEL: {
+            // ММ8031: реверсивные 4-разрядные счётчики. Ось Y
+            // инвертирована («вверх» = положительный код) — при экранных
+            // координатах «вниз = положительный dy» вычитаем.
+            mm_cnt_x_ = mm_clamp(static_cast<int>(mm_cnt_x_) + dx);
+            mm_cnt_y_ = mm_clamp(static_cast<int>(mm_cnt_y_) - dy);
+            break;
+        }
+
+        case mb_mouse_mode_t::MOUSE_OFF:
+        default:
+            // Мышь не подключена — ввод игнорируется
+            break;
+    }
 }
 
 void Mouse::set_buttons(uint8_t buttons) {
-    buttons_ = buttons & 0x07;  // Support up to 3 buttons (bits 0-2)
-}
-
-uint8_t Mouse::read_from_port(uint8_t port) {
-    // Поведение чтения зависит от порта и режима интерфейса
-    switch (interface_mode_) {
-        case InterfaceMode::STANDARD:
-            return read_standard();
-        case InterfaceMode::MOUSE_SYSTEM:
-            return read_mouse_system();
-        case InterfaceMode::KORVET_MOUSE:
-            return read_korvet_mouse();
-    }
-    return 0xFF;  // Default value
-}
-
-uint8_t Mouse::get_ppi3_port_b_value() const {
-    // Значение, которое возвращается при чтении порта B PPI3
-    // В оригинальной реализации здесь были бы данные мыши
-    // Стандартный формат данных мыши для порта B PPI3
-    
-    // Стандартный интерфейс: комбинированные дельты + кнопки
-    int16_t dx = delta_x_;
-    int16_t dy = delta_y_;
-    
-    // Клэмп в 6-битный диапазон (-32..+31)
-    if (dx > 31) dx = 31;
-    if (dx < -32) dx = -32;
-    if (dy > 31) dy = 31;
-    if (dy < -32) dy = -32;
-    
-    // Формат по оригинальному протоколу мыши
-    uint8_t result = 0x40;  // Always set bit 6 (sign bit for both X and Y)
-    result |= (buttons_ & 0x03) << 4;  // Buttons in bits 5-4
-    result |= ((dy & 0xC0) >> 2) & 0x30;  // Top 2 bits of Y in bits 5-4
-    result |= ((dx & 0xC0) >> 4) & 0x0C;  // Top 2 bits of X in bits 3-2
-    result |= 0x03;  // Set lower 2 bits to indicate movement
-    
-    return result;
-}
-
-uint8_t Mouse::read_standard() const {
-    // Стандартный интерфейс мыши
-    if (accumulate_) {
-        // Дельты из накопленного движения
-        int16_t dx = accumulated_x_;
-        int16_t dy = accumulated_y_;
-        
-        // Клэмп без изменения членов класса
-        if (dx > max_delta_) {
-            dx = max_delta_;
-        } else if (dx < -max_delta_) {
-            dx = -max_delta_;
-        }
-        
-        if (dy > max_delta_) {
-            dy = max_delta_;
-        } else if (dy < -max_delta_) {
-            dy = -max_delta_;
-        }
-        
-        // Дельта (зависит от того, какой байт читается)
-        return static_cast<uint8_t>(dx & 0xFF);
-    }
-    
-    return static_cast<uint8_t>(delta_x_ & 0xFF);
-}
-
-uint8_t Mouse::read_mouse_system() const {
-    // Интерфейс Mouse Systems
-    // 5-байтовый пакет по оригинальной спецификации
-    
-    switch (current_packet_byte_) {
-        case 0: {
-            // Байт 1: синхронизация и кнопки
-            uint8_t byte = 0x80;  // Always set bit 7
-            byte |= (buttons_ & 0x01) ? 0x00 : 0x01;  // Left button (active low)
-            byte |= (buttons_ & 0x02) ? 0x00 : 0x04;  // Middle button (active low)
-            byte |= (buttons_ & 0x04) ? 0x00 : 0x02;  // Right button (active low)
-            current_packet_byte_++;
-            return byte;
-        }
-        case 1: {
-            // Байт 2: смещение X
-            current_packet_byte_++;
-            return static_cast<uint8_t>(delta_x_ & 0xFF);
-        }
-        case 2: {
-            // Байт 3: смещение Y
-            current_packet_byte_++;
-            return static_cast<uint8_t>((256 - delta_y_) & 0xFF);
-        }
-        case 3: {
-            // Байт 4: смещение X' (с прошлого пакета)
-            current_packet_byte_++;
-            return 0x00;  // Placeholder
-        }
-        case 4: {
-            // Байт 5: смещение Y' (с прошлого пакета)
-            current_packet_byte_ = 0;  // Reset for next packet
-            return 0x00;  // Placeholder
-        }
-        default:
-            current_packet_byte_ = 0;
-            return 0x00;
-    }
-}
-
-uint8_t Mouse::read_korvet_mouse() const {
-    // Специфичный для Корвета интерфейс мыши
-    // По оригинальному коду значения должны отдаваться в специальном
-    // формате в последовательную очередь
-    
-    // Пока — стандартный формат
-    return read_standard();
-}
-
-void Mouse::clamp_delta(int16_t& delta) {
-    if (delta > max_delta_) {
-        delta = max_delta_;
-    } else if (delta < -max_delta_) {
-        delta = -max_delta_;
-    }
+    // Бит 0 — левая («клавиша 1»), бит 1 — правая («клавиша 2»)
+    buttons_ = buttons & 0x03;
 }
 
 void Mouse::check_mouse() {
+    if (mode_ != mb_mouse_mode_t::MOUSE_SERIAL) {
+        return;  // последовательный путь активен только в MOUSE_SERIAL
+    }
     if (!serial_) return;
 
     // Клампинг накопленных смещений: относительное смещение передаётся
@@ -187,25 +72,28 @@ void Mouse::check_mouse() {
     if (dy > max_delta_) dy = max_delta_;
     else if (dy < -max_delta_) dy = -max_delta_;
 
-    // Биты первого байта по спецификации «Корвета»:
-    //   bit 5 (0x20) — нажата клавиша 1 (левая кнопка),
-    //   bit 4 (0x10) — нажата клавиша 2 (правая кнопка).
-    // (Именно так читает тестовая программа из описания:
-    //  Button_1 = (b1 & 0x20) != 0; Button_2 = (b1 & 0x10) != 0.)
+    // Биты первого байта по документации (приложение А к руководству):
+    //   бит 7 = 0, бит 6 = 1 (маркер первого байта посылки);
+    //   бит 5 (0x20) — нажата клавиша 1 (левая кнопка);
+    //   бит 4 (0x10) — нажата клавиша 2 (правая кнопка);
+    //   биты 3-2 — старшие биты Y, биты 1-0 — старшие биты X.
+    // Кнопки — строго по документации (левая → бит 5): ПО, писавшееся
+    // под реальную мышь, читает именно эту разрядку (тест-программа
+    // приложения А: Button_1 = (b1 & 0x20), Button_2 = (b1 & 0x10)).
     uint8_t btn = 0;
     btn |= (buttons_ & 0x01) ? 0x20 : 0;  // левая  → бит 5
     btn |= (buttons_ & 0x02) ? 0x10 : 0;  // правая → бит 4
 
-    // Посылка шлётся при движении ИЛИ изменении кнопок (реальная мышь
-    // «молчит» только когда ничего не происходит). Движение фиксируем
-    // по ненулевому накопителю ДО клампинга.
+    // Посылка шлётся при движении ИЛИ изменении кнопок («если не
+    // происходит изменения состояния клавишей или движения,
+    // манипулятор молчит»).
     const bool moved = (accumulated_x_ != 0 || accumulated_y_ != 0);
     const bool buttons_changed = (btn != prev_buttons_);
     if (!moved && !buttons_changed) {
         return;
     }
 
-    // 3-байтовый пакет по оригинальному ChkMouse():
+    // 3-байтовый пакет:
     // Байт 1: 0x40 | кнопки | (Y>>6)<<2 | (X>>6)
     // Байт 2: X & 0x3F
     // Байт 3: Y & 0x3F
@@ -217,13 +105,36 @@ void Mouse::check_mouse() {
     serial_->add_to_queue(b2);
     serial_->add_to_queue(b3);
 
-    prev_delta_x_ = dx;
-    prev_delta_y_ = dy;
     prev_buttons_ = btn;
 
     // После отправки накопленные дельты сбрасываются
     accumulated_x_ = 0;
     accumulated_y_ = 0;
+}
+
+uint8_t Mouse::read_mm8031_port_b(bool sync) {
+    // ММ8031 (паспорт §2.6): считывание мультиплексором МХУ по сигналу
+    // «Синхр» — при нулевом уровне выдаётся СЧХ, при единичном — СЧУ;
+    // после каждого считывания формирователь Ф устанавливает счётчики
+    // в исходное состояние 1000b. Кнопки SB1/SB2 («Упр1»/«Упр2») —
+    // «в виде потенциала земли», активный низкий, биты 4-5.
+    uint8_t cnt;
+    if (sync) {
+        cnt = mm_cnt_y_ & 0x0F;   // Синхр=1 → счётчик Y
+        mm_cnt_y_ = 8;            // сброс после считывания
+    } else {
+        cnt = mm_cnt_x_ & 0x0F;   // Синхр=0 → счётчик X
+        mm_cnt_x_ = 8;            // сброс после считывания
+    }
+    // Кнопки: бит 4 = Упр1 (левая), бит 5 = Упр2 (правая), активный низкий
+    uint8_t btn_bits = static_cast<uint8_t>(((buttons_ & 0x03) ^ 0x03) << 4);
+    return cnt | btn_bits;
+}
+
+void Mouse::mm8031_init_pulse() {
+    // Сигнал инициализации с ПК (Порт 2.3): счётчики в исходное состояние
+    mm_cnt_x_ = 8;
+    mm_cnt_y_ = 8;
 }
 
 }  // namespace korvet

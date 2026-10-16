@@ -29,8 +29,8 @@ class Pic;  // Forward declaration
 //  wav-файлов, таймеров реального времени и политик хоста.
 //
 //  По умолчанию deferred-режим ВЫКЛЮЧЕН: поведение побитово идентично
-//  эталону (мгновенное выполнение) — это гарантирует совместимость с
-//  mcp_server/bridge, который ничего не знает о PendingOp.
+//  мгновенному (команда исполняется сразу) — совместимость с ПО,
+//  опрашивающим статус сразу после команды.
 // =====================================================================
 
 /// Тип отложенной операции (категория команды ВГ93).
@@ -82,18 +82,17 @@ struct fdc_state_t {
 };
 
 // ---------------------------------------------------------------------------
-// Fdc — построчный порт диспетчера ВГ93 (КР1818ВГ93) по эталону
-// examples/original/vg.c (DskVG()) + examples/original/floppy.c (FDC_Read/
-// FDC_Write/FDC_Write_DRVREG/FDC_Init/FDC_Reset).
+// Fdc — диспетчер ВГ93 (КР1818ВГ93, аналог WD1793) по описанию БИС
+// и узла НГМД из документации ПК8020.
 //
-// Ключевая идея эталона: единая функция-диспетчер DskVG(), вызываемая на
+// Ключевая идея: единая функция-диспетчер dsk_vg(), вызываемая на
 // КАЖДОЕ обращение к регистрам контроллера (не на такт CPU!) с кодом
 // операции VG.OperIO (0..9). Она же на каждый вызов декрементирует
 // служебные счётчики (CntReady, DskCountDatLost) — это НЕ времязависимая,
 // а СЧЁТНАЯ (по числу обращений к порту) модель времени.
 //
 // Наша реализация верна этому же принципу: dsk_vg(OperIO) вызывается из
-// read()/write()/read_drvreg()/write_drvreg() ровно там же, где в эталоне,
+// read()/write()/read_drvreg()/write_drvreg() в тех же точках,
 // с тем же кодом операции.
 // ---------------------------------------------------------------------------
 class Fdc {
@@ -113,7 +112,7 @@ public:
 
     // Управление дисками — ИСКЛЮЧИТЕЛЬНО через адаптер (см.
     // fdc_image_adapter.hpp). Fdc не хранит и не загружает образы сам;
-    // "вставка"/"извлечение" дискеты — дело хоста (gui_qt5 на Win/Linux
+    // "вставка"/"извлечение" дискеты — дело хоста (Win/Linux
     // открывает/закрывает файл, RP2040 — работает с SD-картой напрямую).
     void set_image_adapter(IFddImageAdapter* adapter) { adapter_ = adapter; }
     bool is_disk_inserted(uint8_t drive) const {
@@ -135,13 +134,22 @@ public:
         if (drive < 4) forced_write_protect_[drive] = read_only;
     }
 
-    // Управление приводом (используется только для отображения в GUI —
-    // в эталоне "мотор" не влияет на тайминг доступа к данным).
-    void set_motor(bool on);
-    void set_drive(uint8_t drive);
-    void set_side(uint8_t side);
-    bool is_motor_on() const { return motor_on_; }
+    // Управление приводом: модель двигателя — перезапускаемый
+    // одновибратор MON (F-1): установка единицы в разряде 5 DRVREG
+    // запускает одновибратор D5, формирующий сигнал MON высокого
+    // уровня длительностью ТРИ СЕКУНДЫ (7500000 тактов CPU). Линия ОБЩАЯ
+    // для всех приводов (без привязки к битам DS). Перезапуск — только
+    // по ПОЛОЖИТЕЛЬНОМУ ПЕРЕПАДУ бита 5. По истечении 3 с формируется
+    // прерывание IRQ7 (MOTINT) — «выключение двигателя» (схема).
+    // Продвижение времени — кадрово: Motherboard вызывает on_frame().
+    void on_frame(uint32_t frame_cycles);
+    bool is_motor_on() const { return mon_active_; }  ///< линия MON (общая)
     uint8_t get_current_drive() const { return current_drive_; }
+
+    /// Разгон двигателя: «для разгона двигателя требуется около 0,5 с,
+    /// после этого можно инициировать операции контроллера» (описание
+    /// элементов). Информационный флаг для хоста (на доступ не влияет).
+    bool is_spinning_up() const { return mon_active_ && mon_remaining_cycles_ > SPINUP_CYCLES; }
 
     // ------------------------------------------------------------------
     // Порты ввода-вывода — соответствуют floppy.c::FDC_Read/FDC_Write.
@@ -160,10 +168,9 @@ public:
     void write_drvreg(uint8_t value);
 
     // INTRQ — программно вычисляемый флаг (см. vg.c: !RegStatus&0x01, т.е.
-    // "не занят"). В эталоне НЕ генерирует аппаратное прерывание PIC —
+    // "не занят"). Аппаратного прерывания PIC НЕ генерирует —
     // это чисто программный сигнал, который ПЗУ само опрашивает.
     bool get_intrq() const { return !(reg_status_ & 0x01); }
-    void clear_intrq() { /* совместимость со старым API; в эталоне INTRQ не «сбрасывается» отдельно */ }
 
     /// ВГ93 BUSY (бит 0 RegStatus) — контроллер выполняет команду.
     /// Пока BUSY, физическая смена дискеты невозможна: хост обязан либо
@@ -171,18 +178,13 @@ public:
     /// восстанавливается сам после завершения команды/INT-команды).
     bool is_busy() const { return (reg_status_ & 0x01) != 0; }
 
-    // DMA — не используется в эталоне (полноценного DMA-контроллера в
-    // Корвете нет), оставлено для совместимости интерфейса.
-    void request_dma(bool request) { dma_request_ = request; }
-    bool is_dma_requested() const { return dma_request_; }
-
     void set_pic(Pic* pic) { pic_ = pic; }
 
     // ------------------------------------------------------------------
     //  Отложенные операции (см. шапку файла). По умолчанию выключены.
     // ------------------------------------------------------------------
     /// Включить/выключить режим отложенных операций. В выключенном
-    /// состоянии поведение идентично эталону (мгновенное выполнение).
+    /// состоянии команды исполняются мгновенно.
     void set_deferred_ops(bool enable) { deferred_ops_ = enable; }
     bool is_deferred_ops() const { return deferred_ops_; }
 
@@ -220,7 +222,7 @@ public:
     // Monitoring interface (для GUI)
     struct FdcStatus {
         bool drives[4];
-        bool motors_on[4];
+        bool motors_on[4];             ///< линия MON (общая для всех приводов)
         uint8_t current_tracks[4];
         uint8_t current_sectors[4];
         bool write_protected[4];
@@ -234,6 +236,10 @@ public:
         uint32_t sectors_written;
         bool pending_op_active;   // открыта отложенная операция (BUSY по ней)
         fdc_pending_op_t pending_op; // её дескриптор (валиден при pending_op_active)
+        /// Кадров с момента последнего обращения к портам контроллера
+        /// (аналог LED-таймера активности: индикатор «1,5 с после
+        /// последнего обращения» — F-4).
+        uint32_t frames_since_last_access;
     };
     FdcStatus get_status() const;
 
@@ -267,11 +273,25 @@ private:
     IFddImageAdapter* adapter_ = nullptr;
     bool forced_write_protect_[4] = {false, false, false, false};
 
-    bool motor_on_ = false;
+    bool motor_on_ = false;          ///< зеркало бита 5 DRVREG (уровень)
     uint8_t current_drive_ = 0;
     uint8_t current_side_ = 0;
 
-    bool dma_request_ = false;
+    // ------------------------------------------------------------------
+    //  Одновибратор MON (F-1): общая линия двигателя НГМД.
+    // ------------------------------------------------------------------
+    bool mon_active_ = false;        ///< сигнал MON высокого уровня
+    uint64_t mon_remaining_cycles_ = 0;  ///< до истечения (3 с = 7 500 000 тактов)
+    bool mon_prev_bit_ = false;      ///< предыдущий уровень бита 5 DRVREG (фронт)
+    uint32_t pending_frames_ = 0;    ///< кадров с начала отложенной операции (F-2)
+    uint32_t last_access_frame_ = 0; ///< кадров с последнего обращения к портам (F-4)
+
+    /// Длительность импульса одновибратора MON: 3 с × 2,5 МГц.
+    static constexpr uint64_t MON_DURATION_CYCLES = 7500000;
+    /// Разгон двигателя ~0,5 с (информационно для хоста).
+    static constexpr uint64_t SPINUP_CYCLES = 1250000;
+    /// Страховочный таймаут отложенной операции (F-2): 25 кадров = 0,5 с.
+    static constexpr uint32_t PENDING_TIMEOUT_FRAMES = 25;
 
     Pic* pic_ = nullptr;
 
@@ -311,7 +331,7 @@ private:
     Exit continue_read_multi();
     Exit continue_write_multi();
 
-    // Маппинг Exit → RegStatus (финальный switch dsk_vg эталона).
+    // Маппинг Exit → RegStatus (финальный switch dsk_vg).
     void apply_exit(Exit ex);
 
     // Построение дескриптора отложенной операции по команде data_io_.

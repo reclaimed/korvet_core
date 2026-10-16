@@ -8,13 +8,6 @@
 namespace korvet
 {
 
-    // Глобальные экземпляры компонентов для подключений PPI
-    Printer *printer_instance = nullptr;
-    Mouse *mouse_instance = nullptr;
-    Joystick *joystick_instance = nullptr;
-    Serial *serial_instance = nullptr;
-    Lan *lan_instance = nullptr; // Добавлен экземпляр LAN
-
     bool Motherboard::init(const mb_config_t *config)
     {
         // ФИКС 6: сохранить указатель для использования в connect_components().
@@ -42,7 +35,12 @@ namespace korvet
         pic_.init();
         ppi_.init();
         serial_.init();
-        lan_.init(); // Initialize new LAN component
+        lan_.init();
+
+        // L-3: адрес рабочего места ЛВС из конфигурации (перемычки
+        // платы): читается гостем через LANADR (PPI1-A биты 4-7).
+        lan_.set_address(config->lan_addr);
+
         tape_.init();
         keyboard_.init();
 
@@ -50,24 +48,35 @@ namespace korvet
         timer_.init();
         audio_.init();
         timer_.set_audio(&audio_);
-        timer_.set_sound_enable(config->sound_enabled);
+        // S-3: конфигурация звука управляет ТОЛЬКО хостовой стороной
+        // (громкость/мьют в Audio). Гейт динамика (бит 3 PPI2-C, SNDEN)
+        // открывается исключительно записью гостя — раньше конфиг
+        // открывал гейт до первого такта, что вместе с высоким
+        // уровнем выхода канала 0 после сброса давало паразитный DC.
         audio_.set_volume(static_cast<uint8_t>(config->sound_volume));
+        audio_.set_sound_enabled(config->sound_enabled);
 
         mouse_.init();
         joystick_.init();
         printer_.init();
         disasm_.init();
 
+        // I-1: источник тактирования канала 2 таймера (TMRINT/IRQ5) —
+        // из конфигурации хоста (по умолчанию HBL, см. mb_timer_ch2_clock_t).
+        timer_.set_channel2_clock(static_cast<mb_timer_ch2_clock_t>(
+            (config->timer_ch2_clock >= 0 && config->timer_ch2_clock <= 3)
+                ? config->timer_ch2_clock : 0));
+
         // ФИКС: раньше здесь конфигурировался транспорт RS232/LAN
         // (TCP/физический порт) через enum SerialMode/LanMode — но это
         // были пустые заглушки (setup_tcp_listener() и т.п. ничего не
         // делали) и лишний повод для korvet_core знать о сокетах и
         // физических портах хоста. Транспорт целиком на стороне хоста:
-        // gui_qt5 сам решает, куда девать байты — см.
+        // хост сам решает, куда девать байты — см.
         // serial_set_byte_out_callback()/lan_set_byte_out_callback() ниже
         // и internal/serial/serial.hpp, internal/lan/lan.hpp.
 
-        // Таймер -> PIC (прерывания)
+        // Таймер -> PIC (прерывания TMRINT)
         timer_.set_pic(&pic_);
 
         initialized_ = true;
@@ -211,35 +220,32 @@ namespace korvet
     void Motherboard::begin_frame()
     {
         cpu_.reset_frame_cycles();
-
-        // Устанавливаем VBLANK в начале кадра для PPI1-A бит 1
-        // В emu80: KorvetCore::vrtc() → m_ppiCircuit->setVbl(true) при старте неактивной области
-        // В оригинале: All_TAKT=50000, VBLANK_TICKS=8170 — первые ~8170 тактов это VBLANK
-        ppi_.set_vbl_state(true);
-
-        // Передаём ACZU attr written flag из video в ppi перед циклом
-        // ПЗУ опрашивает бит 3 PPI1-A в начале загрузки, чтобы понять,
-        // был ли доступ к ACZU (холодный старт vs тёплый старт)
-        ppi_.set_aczu_attr_read(video_.get_aczu_attr_written());
-
+        // VBLANK в PPI1-A (бит 1) вычисляется динамически от числа тактов
+        // кадра — установки флага не требуется (первые ~8170 тактов кадра).
         frame_open_ = true;
     }
 
     void Motherboard::end_frame()
     {
-        // Сбрасываем VBLANK в конце кадра (после VBLANK_TICKS=8170 тактов луч переходит в активную зону)
-        ppi_.set_vbl_state(false);
-
-        // IRQ4 VBLANK поднимается ПОСЛЕ полной порции тактов кадра
+        // Кадр закрыт: учёт тактов и подъём IRQ4 (PERINT — кадровое
+        // прерывание 50 Гц, «прерывание от начала вертикального
+        // бланка»).
+        uint32_t frame_cycles = cpu_.get_frame_cycles();
         pic_.raise_irq(4);
-        total_executed_cycles_ += cpu_.get_frame_cycles();
+        total_executed_cycles_ += frame_cycles;
         frame_open_ = false;
 
-        // Синхронный звук: ровно один раз за кадр, как MakeSound() в
-        // эталоне — переписывает буфер целиком поверх предыдущего кадра.
+        // Синхронный звук: ровно один раз за кадр — переписывает буфер
+        // целиком поверх предыдущего кадра.
         audio_.generate_frame_buffer();
 
+        // Мышь: последовательные посылки формируются раз в кадр
+        // (внутри проверяется режим подключения — см. Mouse::check_mouse).
         mouse_.check_mouse();
+
+        // FDC: продвижение одновибратора MON (3 с, IRQ7 по истечении),
+        // страховочный таймаут отложенной операции, LED-счётчик (F-1..F-4).
+        fdc_.on_frame(frame_cycles);
     }
 
     void Motherboard::track_dead_loop()
@@ -344,7 +350,7 @@ namespace korvet
         // CPU возвращает cost > 0 для обычных инструкций (и подтверждений
         // прерываний — 11 тиков), cost = 0 — точка останова (кадр завершаем
         // досрочно, как в прежней run_frame).
-        // Эталон: examples/original/_main.c:454 — if (Takt >= TICKS_PER_FRAME).
+        // Граница кадра: исполнено >= TICKS_PER_FRAME тактов.
         while (true)
         {
             // 1) Условие остановки (перед каждым шагом — и до первого).
@@ -388,19 +394,18 @@ namespace korvet
             // Обновляем счётчик dead-loop ПОСЛЕ выполнения инструкции
             track_dead_loop();
 
-            // tick() ведёт канал 0 (звук), аудио и проверку прерываний
+            // tick() ведёт все каналы таймера: каналы 0/1 — от 2 МГц
+            // (звук, задатчик скорости ИРПС), канал 2 — от источника
+            // тактирования из конфигурации (по умолчанию HBL, см.
+            // mb_timer_ch2_clock_t); TMRINT/IRQ5 — по фронту OUT канала 2.
             timer_.tick(static_cast<uint32_t>(cost));
 
-            // Channels 1-2 NOT ticked per-instruction — matches original emulator
-            // where DoTMR(1,N) and DoTMR(2,N) are commented out in Timer_Write().
-            // Каналы 1/2 обновляются только прямыми записями в порты.
-
-            // ФИКС: в эталоне (vg.c/floppy.c/_main.c) ВГ93 НЕ генерирует
-            // аппаратное прерывание через PIC вообще — нигде не вызывается
-            // PIC_IntRequest() для FDC. INTRQ — чисто программный флаг
-            // (вычисляется как !RegStatus&0x01, "не занят"), который ПЗУ
-            // само опрашивает через регистр состояния. Ранее здесь стоял
-            // pic_.raise_irq(7), которого в оригинале нет — убран.
+            // Заметка об аппаратных прерываниях ВГ93: контроллер НЕ
+            // генерирует прерываний через PIC по завершении команд —
+            // INTRQ чисто программный флаг (вычисляется как !BUSY),
+            // который ПЗУ опрашивает через регистр состояния. Единственное
+            // прерывание от узла НГМД — MOTINT/IRQ7 от истечения
+            // одновибратора MON (поднимается в Fdc::on_frame).
 
             // 6) Конец кадра — каждые TICKS_PER_FRAME фактических тиков внутри кадра.
             //    Сразу открываем следующий кадр: begin_frame() сбрасывает
@@ -513,7 +518,7 @@ void Motherboard::set_interrupt_callback(mb_interrupt_callback_t callback, void 
 }
 
 // T4.4 / Критерий приёмки №3: сигнатуры callback'ов должны быть
-// идентичны в korvet_core и gui_qt5. Здесь мы просто пробрасываем
+// идентичны в ядре и хосте. Здесь мы просто пробрасываем
 // GUI-callback в Logger. Никаких адаптеров-обёрток с потерей
 // user_data — компилятор проверит совместимость через using-объявления
 // в motherboard_types.hpp.
@@ -536,18 +541,29 @@ void Motherboard::keyboard_key_release(uint16_t key_code)
 
 bool Motherboard::get_keyboard_language_layout() const
 {
-    // Тот же механизм, что и в эталоне (_main.c/keyboard.c):
-    //   KBD_LED = RAM[0xF72E] ^ (KEYBOARD_Read(0x80) & 2);
+    // K-1: адрес флага ЛАТ/РУС — деталь конкретной версии ПЗУ (флаг
+    // BIOS), вынесен в конфигурацию (kbd_lang_flag_addr, по умолчанию
+    // 0xF72E — ПЗУ 2.0). 0xFFFF — хак выключен: метод вернёт false.
+    // Механизм тот же, что использовал индикатор раскладки:
+    //   KBD_LED = RAM[<адрес>] ^ (KEYBOARD_Read(0x80) & 2);
     //   true (QWERTY) при KBD_LED == 2.
-    // RAM[0xf72e] в эталоне — прямой доступ к физическому массиву памяти,
-    // в обход маппера страниц (это не чтение шиной CPU, а сам эмулятор
-    // подглядывает состояние). KEYBOARD_Read(0x80) — тоже прямой вызов
-    // компонента клавиатуры с "сырым" адресом 0x80, а не чтение через
-    // шину. Повторяем оба нюанса буквально.
-    uint8_t ram_flag = memory_.get_ram()[0xF72E];
+    // Чтение RAM — прямой доступ к физическому массиву в обход
+    // маппера страниц (это не чтение шиной CPU, а подглядывание
+    // состояния; осознанное эмуляторное расширение для GUI-индикации).
+    if (!saved_config_ ||
+        saved_config_->kbd_lang_flag_addr == 0xFFFF)
+    {
+        return false;
+    }
+    uint8_t ram_flag = memory_.get_ram()[saved_config_->kbd_lang_flag_addr];
     uint8_t port_bit = keyboard_.read(0x80) & 0x02;
     uint8_t kbd_led = ram_flag ^ port_bit;
     return kbd_led == 2;
+}
+
+void Motherboard::mouse_set_mode(mb_mouse_mode_t mode)
+{
+    mouse_.set_mode(mode);
 }
 
 void Motherboard::mouse_move(int16_t dx, int16_t dy)
@@ -560,15 +576,32 @@ void Motherboard::mouse_set_buttons(uint8_t buttons)
     mouse_.set_buttons(buttons);
 }
 
-void Motherboard::joystick_set_axis(uint8_t axis, uint8_t value)
+void Motherboard::joystick_set_connected(bool connected)
 {
-    (void)axis;
-    (void)value;
+    joystick_.set_connected(connected);
+}
+
+void Motherboard::joystick_set_direction(joystick_direction_t dir, bool active)
+{
+    // E-2: экспорт направления МД8030 в фасад (раньше метод был
+    // недостижим через публичный API — джойстик «вечно отключён»)
+    switch (dir)
+    {
+        case joystick_direction_t::JOY_UP:    joystick_.set_direction_up(active); break;
+        case joystick_direction_t::JOY_DOWN:  joystick_.set_direction_down(active); break;
+        case joystick_direction_t::JOY_LEFT:  joystick_.set_direction_left(active); break;
+        case joystick_direction_t::JOY_RIGHT: joystick_.set_direction_right(active); break;
+    }
 }
 
 void Motherboard::joystick_set_button(uint8_t button, bool pressed)
 {
     joystick_.set_button(button, pressed);
+}
+
+void Motherboard::timer_set_channel2_clock(mb_timer_ch2_clock_t source)
+{
+    timer_.set_channel2_clock(source);
 }
 
 void Motherboard::fdd_set_image_adapter(IFddImageAdapter *adapter)
@@ -621,15 +654,30 @@ void Motherboard::lan_inject_byte(uint8_t byte)
     lan_.process_input(byte);
 }
 
-bool Motherboard::tape_insert_buffer(const uint8_t *data, size_t size)
+void Motherboard::tape_set_input(uint8_t initial_level,
+                                 const uint32_t* half_period_cycles, size_t count)
 {
-    return tape_.set_data(data, size);
+    tape_.set_input(initial_level, half_period_cycles, count);
 }
 
-bool Motherboard::tape_eject()
+void Motherboard::tape_input_append(const uint32_t* half_period_cycles, size_t count)
 {
-    tape_.eject();
-    return true;
+    tape_.input_append(half_period_cycles, count);
+}
+
+void Motherboard::tape_input_rewind()
+{
+    tape_.input_rewind();
+}
+
+void Motherboard::tape_set_out_callback(TapeOutCallback cb)
+{
+    tape_.set_out_callback(std::move(cb));
+}
+
+void Motherboard::tape_set_relay_callback(TapeRelayCallback cb)
+{
+    tape_.set_relay_callback(std::move(cb));
 }
 
 void Motherboard::load_data(const uint8_t *rom, size_t rom_size,
@@ -668,20 +716,37 @@ void Motherboard::connect_components()
     ppi_.set_video(&video_);
     ppi_.set_fdc(&fdc_);
     ppi_.set_timer(&timer_);
+    ppi_.set_printer(&printer_);
+    ppi_.set_mouse(&mouse_);
+    ppi_.set_joystick(&joystick_);
+    ppi_.set_serial(&serial_);
+    ppi_.set_tape(&tape_);
+    ppi_.set_lan(&lan_);
     ppi_.set_frame_cycles_getter([this]()
                                  { return static_cast<uint32_t>(cpu_.get_frame_cycles()); });
+    // Абсолютное время (такты CPU) — для событий кассеты CASOUT/CASIN
+    // и реле стопа (T-1: единицы времени ядра — такты CPU).
+    ppi_.set_cycle_getter([this]() { return get_current_cycles(); });
 
     // Цепочка прерываний
     cpu_.set_pic(&pic_);
 
-    // Таймер -> CPU и PIC
+    // Таймер -> PIC (TMRINT/IRQ5 — фронт OUT канала 2)
     timer_.set_pic(&pic_);
 
-    // Serial + мышь (генерация пакетов мыши)
+    // ИРПС/ЛВС -> PIC (SERINT1/IRQ1, SERINT2/IRQ2, LANINT/IRQ3)
     serial_.set_pic(&pic_);
+    lan_.set_pic(&pic_);
+
+    // Serial + мышь (генерация пакетов последовательной мыши)
     mouse_.set_serial(&serial_);
 
-    // FDC -> PIC (IRQ6, данные готовы)
+    // Принтер -> PIC (LSTINT/IRQ6 — конец занятости)
+    printer_.set_pic(&pic_);
+
+    // FDC -> PIC (только MOTINT/IRQ7 — выключение двигателя по
+    // истечении одновибратора MON; завершение команд ВГ93 опрашивается
+    // программно через регистр статуса — см. fdc.cpp)
     fdc_.set_pic(&pic_);
 
     // Память -> компоненты (доступ к периферии)
@@ -694,13 +759,6 @@ void Motherboard::connect_components()
     memory_.set_timer(&timer_);
     memory_.set_keyboard(&keyboard_);
     memory_.set_pic(&pic_);
-
-    // Глобальные экземпляры
-    printer_instance = &printer_;
-    mouse_instance = &mouse_;
-    joystick_instance = &joystick_;
-    serial_instance = &serial_;
-    lan_instance = &lan_; // Подключение экземпляра LAN
 }
 
 // Конфигурация теперь выполняется собственными методами компонентов

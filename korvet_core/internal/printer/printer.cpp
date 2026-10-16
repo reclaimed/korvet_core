@@ -10,6 +10,8 @@
  */
 
 #include "printer.hpp"
+#include "../pic/pic.hpp"
+#include "../logger/logger.hpp"
 
 namespace korvet {
 
@@ -26,6 +28,7 @@ Printer::Printer()
     , status_delay_counter_(0)
     , prev_strobe_state_(false)
     , printed_bytes_count_(0)
+    , disabled_warned_(false)
 {
 }
 
@@ -50,6 +53,7 @@ void Printer::reset()
     status_delay_counter_ = 0;
     prev_strobe_state_ = false;
     printed_bytes_count_ = 0;
+    disabled_warned_ = false;
 }
 
 void Printer::write_data(uint8_t data)
@@ -114,17 +118,24 @@ bool Printer::process_strobe(bool strobe_state)
 
 uint8_t Printer::read_status()
 {
-    // Байт статуса принтера
-    // По оригинальной реализации: =1 при готовности, =0 при занятости
-    // В оригинале — простой статус ready/busy
-    // с имитацией задержки
+    // Байт статуса принтера (LSTRDY): =1 при готовности, =0 при занятости.
+    // Задержка неготовности — 5 чтений статуса после печати (модель
+    // занятости механики).
     
     if (status_delay_counter_ > 0) {
         status_delay_counter_--;
+        if (status_delay_counter_ == 0) {
+            // X-2: LSTINT (IRQ6) — конец занятости (BUSYP → низкий):
+            // «интерфейс принтера — уровень 6 прерываний». ПО, печатающее
+            // по прерыванию готовности, получает запрос здесь.
+            if (pic_) {
+                pic_->raise_irq(6);
+            }
+        }
         return 0; // Not ready during delay
     }
     
-    // =1 — готов (оригинал возвращает 1 при готовности)
+    // =1 — готов
     return 1;
 }
 
@@ -135,11 +146,20 @@ void Printer::set_enabled(bool enabled)
 
 void Printer::send_to_output(uint8_t byte)
 {
-    if (!enabled_) return;
+    if (!enabled_) {
+        // X-2: без printer_set_enabled() байты терялись бы МОЛЧА —
+        // предупреждаем один раз, чтобы интегратор видел проблему.
+        if (!disabled_warned_) {
+            disabled_warned_ = true;
+            LOG_WARN("Printer: байт потерян — принтер не включён (printer_set_enabled(true))");
+        }
+        return;
+    }
     
     // Apply inverse mapping (original code does PPI2_A^0xff) — часть
     // эмулируемого железа, остаётся здесь независимо от того, куда
-    // байт уйдёт дальше.
+    // байт уйдёт дальше. LSTINV: «в драйверы... необходимо вводить
+    // инвертирование передаваемого байта» (описание элементов).
     uint8_t processed_byte = byte ^ 0xFF;
     
     if (output_cb_) {
@@ -149,7 +169,7 @@ void Printer::send_to_output(uint8_t byte)
     // Инкремент счётчика напечатанных байтов
     printed_bytes_count_++;
     
-    // Задержка статуса (в оригинале — на 5 чтений порта)
+    // Задержка статуса (на 5 чтений порта)
     status_delay_counter_ = 5;
 }
 

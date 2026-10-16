@@ -48,9 +48,12 @@ void Memory::init(const mb_config_t* config, Video* video, Fdc* fdc) {
     
     // Инициализация точек останова
     breakpoints_.fill(0);
-    
+
     sysreg_ = 0;
-    lan_ = nullptr;
+    // W-7: lan_ БОЛЬШЕ не обнуляется здесь — connect_components()
+    // вызывается ДО memory_.init() в Motherboard::init(), и эта строка
+    // убивала маршрутизацию портов ЛВС (0x20/0x21) для всего гостевого
+    // ПО. Указатели компонентов имеют default-инициализаторы в .hpp.
 }
 
 void Memory::reset() {
@@ -314,9 +317,9 @@ void Memory::handle_peripheral_write(uint16_t addr, uint8_t data) {
         case 3:  // FDC
             if (fdc_) fdc_->write(port, data);
             break;
-        case 4:  // LAN
+        case 4:  // LAN: 0x20 — данные, 0x21 — управление/статус (бит A0)
             if (lan_) {
-                lan_->write(data);
+                lan_->write(port, data);
             }
             break;
         case 5:  // PIC
@@ -348,9 +351,9 @@ uint8_t Memory::handle_peripheral_read(uint16_t addr) {
         case 3:  // FDC
             if (fdc_) return fdc_->read(port);
             break;
-        case 4:  // LAN
+        case 4:  // LAN: 0x20 — данные, 0x21 — управление/статус (бит A0)
             if (lan_) {
-                return lan_->read();
+                return lan_->read(port);
             }
             break;
         case 5:  // PIC

@@ -40,7 +40,14 @@ void Fdc::reset() {
     motor_on_ = false;
     current_drive_ = 0;
     current_side_ = 0;
-    dma_request_ = false;
+
+    // Одновибратор MON (F-1): после сброса линия двигателя низкая,
+    // фронт-детектор бита 5 DRVREG — «был низкий уровень».
+    mon_active_ = false;
+    mon_remaining_cycles_ = 0;
+    mon_prev_bit_ = false;
+    pending_frames_ = 0;
+    last_access_frame_ = 0;
 
     // Отложенных операций после сброса не существует (совместимо с
     // «сброс контроллера» реальной ВГ93 — BUSY гаснет).
@@ -51,10 +58,6 @@ void Fdc::reset() {
     dsk_vg(0x0C);
     dsk_vg(0x0A);
 }
-
-void Fdc::set_motor(bool on) { motor_on_ = on; }
-void Fdc::set_drive(uint8_t drive) { if (drive < 4) current_drive_ = drive; }
-void Fdc::set_side(uint8_t side) { current_side_ = side & 1; }
 
 bool Fdc::read_sector_from_disk(int track, uint8_t side, uint8_t sector, uint8_t* buf) {
     uint8_t drive = system_ & 0x03;
@@ -69,8 +72,8 @@ bool Fdc::write_sector_to_disk(int track, uint8_t side, uint8_t sector, const ui
 }
 
 // ---------------------------------------------------------------------------
-// disk_init()/disk_uninit() — аналог DiskVG(0xA)/DiskVG(0xB) в эталоне.
-// В эталоне это реально открывает/закрывает файл на диске; у нас "открытие"
+// disk_init()/disk_uninit() — пересчёт состояния диска по наличию носителя.
+// На реальном железе тут включается/выключается привод; в модели
 // диска — это просто вопрос к адаптеру, вставлен ли физически носитель
 // в ТЕКУЩИЙ выбранный (system_&0x03) дисковод. Сам файл/сектор адаптер
 // открывает лениво, по каждому read_sector()/write_sector() — Fdc об этом
@@ -124,7 +127,7 @@ static inline void set_state_step_impl(int& reg_track, uint8_t& track_real_slot,
 
 // ---------------------------------------------------------------------------
 // Команды ВГ93 — бывшие блоки switch(reg_command_>>4) внутри case 0x1.
-// Логика побитово сохранена из эталона; изменена только упаковка в методы,
+// Логика побитово по описанию БИС ВГ93; изменена только упаковка в методы,
 // чтобы один и тот же код работал и в синхронном пути, и в complete_pending().
 // ---------------------------------------------------------------------------
 
@@ -142,7 +145,7 @@ void Fdc::cmd_seek() {
     int target = reg_data_;
     track_real_[system_ & 0x03] = static_cast<uint8_t>(target);
     reg_track_ = target;
-    // (эталонная проверка знака тут вырождена, т.к. RegData-RegTrack==0 всегда
+    // (проверка знака тут вырождена, т.к. RegData-RegTrack==0 всегда
     //  сразу после присваивания — сохраняем как есть для точности порта)
     step_direct_ = -1;
     set_state_step_impl(reg_track_, track_real_[system_ & 0x03],
@@ -202,14 +205,14 @@ Fdc::Exit Fdc::cmd_write_sector() {
 Fdc::Exit Fdc::cmd_read_address() {
     // Чтение адреса (0xCx)
     dsk_data_size_ = 0x0005;
-    reg_data_ = 1; // ReadIndexTrack всегда 0 в эталоне
+    reg_data_ = 1; // ReadIndexTrack всегда 0 (мгновенная модель)
     return Exit::OP_COM;
 }
 
 Fdc::Exit Fdc::cmd_write_track() {
     // Запись дорожки (0xFx)
     if (dsk_status_ & 0x40) { return Exit::OP_WRPROT; }
-    dsk_data_size_ = 1; // FormatDatLen всегда 1 в эталоне
+    dsk_data_size_ = 1; // FormatDatLen всегда 1 (мгновенная модель)
     return Exit::OP_COM;
 }
 
@@ -269,7 +272,7 @@ Fdc::Exit Fdc::dsk_vg_command() {
         case 0xC: { // Чтение адреса
             return cmd_read_address();
         }
-        case 0xE: { // Чтение дорожки — не реализовано в эталоне
+        case 0xE: { // Чтение дорожки — не моделируется (мгновенная модель)
             return Exit::NONE;
         }
         case 0xF: { // Запись дорожки
@@ -280,7 +283,7 @@ Fdc::Exit Fdc::dsk_vg_command() {
 }
 
 void Fdc::apply_exit(Exit ex) {
-    // Финальный switch(exit_via) эталонного DskVG().
+    // Финальный switch(exit_via) — маппинг результата на регистр статуса.
     switch (ex) {
         case Exit::OP_OK:       reg_status_ = 0x00; return;
         case Exit::OP_WRPROT:   reg_status_ = 0x40; return;
@@ -290,8 +293,7 @@ void Fdc::apply_exit(Exit ex) {
             dsk_count_dat_lost_ = 0x00;
             cnt_data_ = 0x0000;
             reg_status_ = 0x03;
-            // Ready в эталоне всегда 1 (глобальная переменная, нигде не
-            // сбрасывается) — ветка "if (!Ready)" в эталоне мертва, поэтому
+            // Готовность привода всегда 1 — ветка неготовности мертва, поэтому
             // здесь намеренно опущена: reg_status_ всегда остаётся 0x03.
             return;
         }
@@ -310,6 +312,8 @@ void Fdc::begin_pending_op() {
     const uint8_t cmd = data_io_;
     const uint8_t hi = cmd >> 4;
     const uint8_t drive = system_ & 0x03;
+    // F-2: старт отсчёта страховочного таймаута (см. on_frame)
+    pending_frames_ = 0;
 
     pending_op_ = fdc_pending_op_t{};
     pending_op_.command = cmd;
@@ -403,27 +407,31 @@ fdc_op_result_t Fdc::complete_pending() {
 
 // ---------------------------------------------------------------------------
 // dsk_vg() — построчный порт DskVG() из vg.c. oper_io соответствует VG.OperIO.
-// Вызывается на КАЖДОЕ обращение к регистру контроллера, как в эталоне —
+// Вызывается на КАЖДОЕ обращение к регистру контроллера —
 // не на такт CPU. Это принципиально: служебные счётчики (cnt_ready_,
 // dsk_count_dat_lost_) считают ЧИСЛО ОБРАЩЕНИЙ, а не время.
 // ---------------------------------------------------------------------------
 void Fdc::dsk_vg(uint8_t oper_io) {
+    // F-4: любое обращение к портам контроллера сбрасывает LED-таймер
+    // активности (индикатор «1,5 с после последнего обращения»).
+    last_access_frame_ = 0;
+
     // Счётчики «потери данных»/«неготовности» (DskCountDatLost/CntReady) —
-    // модель ФАЗЫ ДАННЫХ эталона: они затухают от числа ОБРАЩЕНИЙ К ПОРТАМ,
-    // пока контроллер BUSY. В эталоне (мгновенные команды) фаза ожидания
+    // модель ФАЗЫ ДАННЫХ: они затухают от числа ОБРАЩЕНИЙ К ПОРТАМ,
+    // пока контроллер BUSY. При мгновенных командах фаза ожидания
     // команды гостем не существует, поэтому счётчики начинают жизнь только
     // после исполнения команды. В deferred-режиме гость честно ждёт BUSY
     // (позиционирование!) и успевает опросить статус много раз — затухание
     // срабатывало бы СРЕДИ ожидания и портило статус (0x04/0x03 до
     // завершения команды). Поэтому на время открытой отложенной операции
-    // счётчики заморожены. Синхронный режим (mcp_server) не задет:
+    // счётчики заморожены. Мгновенный режим не задет:
     // pending_active_ там всегда false.
     if (!pending_active_) {
         if ((reg_status_ & 0x01) && !--dsk_count_dat_lost_) reg_status_ = 0x04;
         if (cnt_ready_) { if (!--cnt_ready_) reg_status_ = 0x03; }
     }
 
-    // goto-метки эталона реализованы через локальный enum-результат.
+    // goto-метки диспетчера реализованы через локальный enum-результат.
     Exit exit_via = Exit::NONE;
 
     switch (oper_io) {
@@ -434,13 +442,25 @@ void Fdc::dsk_vg(uint8_t oper_io) {
             break;
         }
         case 0x1: { // Запись команды
+            // F-3: FORCE INTERRUPT (0xD0, команда типа IV) — ЕДИНСТВЕННАЯ
+            // команда, принимаемая при BUSY: прекращает текущую операцию
+            // (в т.ч. многосекторную и отложенную) и опционально генерирует
+            // INTRQ. Биты 0-3 задают условие прерывания; в мгновенной
+            // модели временных условий нет — реализуем немедленное
+            // завершение (IMMID-вариант, бит 0).
+            if ((data_io_ & 0xF0) == 0xD0) {
+                pending_active_ = false;   // отменить отложенную операцию
+                pending_frames_ = 0;
+                cnt_data_ = 0;             // сброс фазы данных
+                dsk_data_size_ = 0;
+                reg_status_ &= ~0x01;      // BUSY — выключен
+                reg_status_ &= ~0x02;      // DRQ — выключен
+                break;
+            }
             if (reg_status_ & 0x01) {
-                // Принудительное прерывание — в эталоне тут пусто (не Force
-                // Interrupt как отдельная ветка, см. ниже: пока BUSY,
-                // единственное что реально принимается — 0xD0 фильтруется
-                // следующей строкой до диспетчеризации).
+                // При BUSY прочие команды игнорируются (как на реальной
+                // ВГ93; Force Interrupt обработан выше).
             } else {
-                if ((data_io_ & 0xF0) == 0xD0) { break; } // return — команда Force Interrupt здесь игнорируется (не BUSY)
                 // ---------------------------------------------------------
                 // Режим отложенных операций: команда Type I/II/III не
                 // исполняется сейчас — формируется дескриптор PendingOp и
@@ -450,7 +470,7 @@ void Fdc::dsk_vg(uint8_t oper_io) {
                 const uint8_t hi = data_io_ >> 4;
                 // Type I (0x0-0x7), Type II (0x8-0xB) и Read Address (0xC).
                 // 0xD (Force Interrupt) фильтруется выше; 0xE/0xF (дорожки)
-                // остаются мгновенными, как в эталоне.
+                // остаются мгновенными.
                 const bool deferrable = deferred_ops_ && !pending_active_ && (hi <= 0xC);
                 if (deferrable) {
                     begin_pending_op();
@@ -640,20 +660,66 @@ void Fdc::write_drvreg(uint8_t value) {
     uint8_t real_drive = DRV_TABLE[raw_drive];
     data_io_ = (value & 0xF0) | real_drive;
 
-
     dsk_vg(0x9);
 
     // Отражаем в служебные поля для GUI/мониторинга (не влияет на dsk_vg()).
     current_drive_ = system_ & 0x03;
     current_side_  = (system_ & DRVREG_SIDE) ? 1 : 0;
     motor_on_      = (value & DRVREG_MOTOR) != 0;
+
+    // F-1: одновибратор MON — перезапускаемый, запуск ТОЛЬКО по
+    // положительному перепаду бита 5 DRVREG (0→1). Повторная запись
+    // с уже установленным битом продлевает импульс ещё на 3 с; запись
+    // со сброшенным битом НЕ останавливает мотор — импульс дотекает.
+    if (motor_on_ && !mon_prev_bit_) {
+        mon_active_ = true;
+        mon_remaining_cycles_ = MON_DURATION_CYCLES;
+    }
+    mon_prev_bit_ = motor_on_;
+}
+
+void Fdc::on_frame(uint32_t frame_cycles) {
+    // F-1: истечение одновибратора MON — линия двигателя падает,
+    // на инверсном выходе формируется прерывание IRQ7 (MOTINT):
+    // «процессор программно обслуживает этот запрос» (схема).
+    if (mon_active_) {
+        if (mon_remaining_cycles_ > frame_cycles) {
+            mon_remaining_cycles_ -= frame_cycles;
+        } else {
+            mon_remaining_cycles_ = 0;
+            mon_active_ = false;
+            if (pic_) {
+                pic_->raise_irq(7);  // MOTINT — выключение двигателя
+            }
+        }
+    }
+
+    // F-2: страховочный таймаут отложенной операции. Контракт —
+    // ровно один complete_pending() на каждый колбэк хоста; если
+    // колбэк/таймер хоста потерян, BUSY не должен висеть вечно.
+    if (pending_active_) {
+        pending_frames_++;
+        if (pending_frames_ >= PENDING_TIMEOUT_FRAMES) {
+            LOG_WARN("FDC: отложенная операция зависла (%u кадров) — автозавершение",
+                     (unsigned)pending_frames_);
+            complete_pending();
+        }
+    } else {
+        pending_frames_ = 0;
+    }
+
+    // F-4: счётчик кадров с последнего обращения к портам (LED активности)
+    last_access_frame_++;
 }
 
 Fdc::FdcStatus Fdc::get_status() const {
     FdcStatus s{};
     for (int i = 0; i < 4; i++) {
         s.drives[i] = adapter_ && adapter_->is_present(static_cast<uint8_t>(i));
-        s.motors_on[i] = (i == current_drive_) && motor_on_;
+        // F-1: линия MON ОБЩАЯ для всех приводов — состояние двигателя
+        // не зависит от выбранных бит DS. Хост озвучивает/подсвечивает
+        // выбранный привод (selected_drive), линия же едина для всех.
+        s.motors_on[i] = mon_active_;
         s.current_tracks[i] = track_real_[i];
         s.current_sectors[i] = (i == current_drive_) ? reg_sector_ : 0;
         s.write_protected[i] = is_write_protected(static_cast<uint8_t>(i));
@@ -671,6 +737,7 @@ Fdc::FdcStatus Fdc::get_status() const {
     s.sectors_written = 0;
     s.pending_op_active = pending_active_;
     s.pending_op = pending_active_ ? pending_op_ : fdc_pending_op_t{};
+    s.frames_since_last_access = last_access_frame_;
     return s;
 }
 

@@ -35,7 +35,7 @@ void Video::reset() {
         }
     }
     
-    // Initialize ACZU with zeros (как в эталоне examples/original/screen.c:237).
+    // АЦЗУ инициализируется нулями: символ 0x00, атрибут 0x00.
     //
     // Ранее здесь был 0xFF — это давало "инвертированный" текстовый мусор
     // при первом cold-boot, потому что в режиме aczu_attr_write_=0 (ATRFRE
@@ -43,7 +43,7 @@ void Video::reset() {
     // растровым шрифтом даёт инвертированный (тёмный) символ.
     // BIOS в начале пишет текст в ACZU, но до этого момента экран
     // показывает содержимое памяти.
-    // В эталоне: ACZU[i] = 0 → символ 0x00 (NUL), атрибут 0x00 → чёрный экран.
+    // ACZU[i] = 0 → символ 0x00 (NUL), атрибут 0x00 → чёрный экран.
     // CPU первым делом пишет символы туда (например, вывод "BASIC" при старте),
     // после чего атрибут устанавливается правильно.
     for (auto& byte : aczu_) {
@@ -73,8 +73,8 @@ void Video::reset() {
 
     ncreg_ = 0;
     vireg_ = 0;
-    // visst_ (scr_Attr_Read в эталоне) инициализируется 0 при reset — см.
-    // examples/original/screen.c:246. BIOS интерпретирует 0 как "память
+    // visst_ инициализируется 0 при reset.
+    // BIOS интерпретирует 0 как "память
     // ещё не читалась" и берёт cold-boot путь.
     visst_ = 0;
 
@@ -85,7 +85,6 @@ void Video::reset() {
     lut_write_protect_ = false;
     
     frame_modified_ = true;
-    first_nonzero_frame_logged_ = false;
     current_line_ = 0;
     
     // Инициализация флагов обновления строк
@@ -94,10 +93,8 @@ void Video::reset() {
     }
     full_redraw_pending_ = true;
     
-    // Очистка кадрового буфера
-    for (auto& pixel : framebuffer_) {
-        pixel = 0;
-    }
+    // Кадровые буферы (back/front) очищаются при первом рендере —
+    // std::array<uint8_t, ...> обнулён по умолчанию (value-init члена).
     
 }
 
@@ -106,44 +103,19 @@ void Video::set_font(const uint8_t* data, size_t size) {
         LOG_WARN("Cannot load font: data is null");
         return;
     }
-    // Обычный шрифт — первые 4096 байт (256 символов x 16 байт)
-    size_t normal_size = (size < 4096) ? size : 4096;
-    std::copy(data, data + normal_size, font_.data());
-    for (size_t i = normal_size; i < 4096; i++) {
+    // V-1: файл шрифта знакогенератора — 8192 байт = ДВА набора
+    // символов (основной + псевдографика; FONT1 = бит 2 VIREG).
+    // Раньше копировались только первые 4096 байт — второй
+    // знакогенератор отбрасывался при загрузке.
+    size_t copy_size = (size < FONT_SIZE) ? size : FONT_SIZE;
+    std::copy(data, data + copy_size, font_.begin());
+    for (size_t i = copy_size; i < FONT_SIZE; i++) {
         font_[i] = 0;
     }
-    create_wide_font();
-}
-
-void Video::create_wide_font() {
-    // Строим широкий шрифт из обычного (как в оригинале screen.c)
-    uint8_t* src = font_.data();
-    uint8_t* dst = &font_[FONT_SIZE / 2]; // Second half of font array for wide font
-    
-    for (int i = 0; i < FONT_SIZE / 2; i++) {
-        uint8_t wmask, m;
-        // Первый широкий байт
-        wmask = 0xc0;
-        m = 0x80;
-        dst[0] = 0;
-
-        for (int j = 0; j < 4; j++) {
-            if (src[i] & m) dst[0] |= wmask;
-            m >>= 1;
-            wmask >>= 2;
-        }
-        dst++;
-        
-        // Второй широкий байт
-        wmask = 0xc0;
-        dst[0] = 0;
-        for (int j = 0; j < 4; j++) {
-            if (src[i] & m) dst[0] |= wmask;
-            m >>= 1;
-            wmask >>= 2;
-        }
-        dst++;
-    }
+    // Широкий режим НЕ требует отдельного буфера: деление тактовой
+    // VCLK/SHIFT при MODSEL растягивает тот же шрифт по времени
+    // (схема, «А/Ц Дисплей») — в рендере разворачиваем байт таблицей
+    // WEXPAND (16 байт вместо 16 КБ, важно для RP2040).
 }
 
 void Video::write_aczu_raw(size_t offset, const uint8_t* data, size_t len) {
@@ -243,7 +215,7 @@ void Video::aczu_write(uint16_t addr, uint8_t value) {
     
     // VISTS (PPI1-A bit 3): сбрасывается при записи в ACZU.
     // В реальном железе: scr_Attr_Read = 0 при любой записи в текстовую память.
-    // В emu80: m_textAdapter->getAttr() отражает фазу атрибута в цикле CRTC,
+    // Фаза атрибута в цикле CRTC
     // которая сбрасывается при записи CPU.
     aczu_attr_written_ = false;
     
@@ -317,31 +289,6 @@ void Video::lut_update_rgb() {
     }
 }
 
-uint8_t Video::read_keyboard_port(uint16_t addr) {
-    // Матрица клавиатуры Корвета — 8 строк x 12 столбцов
-    // Чтение: записью адреса выбираются строки, затем чтением того же
-    // адреса возвращаются биты столбцов выбранных строк
-    
-    // Как устроена матрица:
-    // - 8 основных строк (0-7) по 8 столбцов (биты 0-7)
-    // - 4 расширенные строки (8-11) по 8 столбцов (биты 0-7)
-    // - адрес выбирает, какие строки читаются
-    // - каждый бит — столбец в выбранной строке
-    
-    // Матрица читается установкой адресных линий
-    // и чтением соответствующих битов столбцов
-    
-    // Здесь следовало бы делегировать компоненту клавиатуры,
-    // но у видео нет прямого доступа к клавиатуре —
-    // чтение идёт через память (см. Memory::handle_peripheral_read).
-    
-    // В оригинале чтение клавиатуры шло через систему памяти,
-    // которая вызывала компонент клавиатуры.
-    // Пока возвращаем 0xFF (нет нажатых клавиш)
-    // (реальная реализация — Memory + Keyboard)
-    return 0xFF;
-}
-
 void Video::on_sysreg_change(uint8_t sysreg) {
     // Реакция на смену системного регистра — влияет на конфигурацию видео:
     // системный регистр задаёт конфигурацию памяти, от которой зависит
@@ -369,7 +316,7 @@ void Video::render_scanline(uint8_t y, uint8_t* buffer) {
     // (для двух групп по 4 пикселя), где нибблы уже содержат бит соответствующей
     // плоскости. OR 4 табличных значений = 8 нибблов = 8 пикселей.
     // Скорость: 4 lookup + 4 OR = 8 операций на 8 пикселей (vs ~160 в побитовом цикле).
-    // Источник: examples/original/screen.c:508 (Korvet ETALON emulator).
+    // Табличная растеризация: 4 lookup + 4 OR на 8 пикселей.
     uint8_t* gzu_ptr = &gzu_planes_[gzu_show_page_][y * 64 * 4];
     const auto& m01 = plane_mask_01();
     const auto& m02 = plane_mask_02();
@@ -411,40 +358,43 @@ void Video::render_frame(uint8_t* framebuffer) {
         render_scanline(y, &back_framebuffer_[static_cast<size_t>(y) * SCREEN_WIDTH]);
     }
     
-    // P3: отладочный лог первого ненулевого кадра
-    if (!first_nonzero_frame_logged_) {
-        bool any_nonzero = false;
-        for (int i = 0; i < 6; i++) {
-            if (framebuffer[i] != 0) { any_nonzero = true; break; }
-        }
-        if (any_nonzero) {
-            first_nonzero_frame_logged_ = true;
-        }
-    }
-    
     full_redraw_pending_ = false;
     frame_modified_ = false;
 }
 
 void Video::write_vireg(uint8_t value) {
-    // Лог INFO: важные изменения режима видео. Должно быть редким событием.
-    // Разбираем поля регистра
+    // Разбираем поля регистра управления видео (VIREG, порт C ППР№1):
+    //   биты 6-7 — страница ГЗУ для доступа CPU;
+    //   биты 5-4 — режим записи атрибута АЦЗУ;
+    //   бит 3 — широкий режим (32 символа в строке);
+    //   бит 2 — второй знакогенератор (FONT1);
+    //   биты 1-0 — страница ГЗУ для отображения.
+    uint8_t old_read_page = gzu_read_page_;
     gzu_read_page_ = ((value & 0xc0) >> 6) & gzu_size_mask_;
     aczu_attr_write_ = (value & 0x30) >> 4;
     aczu_wide_mode_ = (value & 0x08) >> 3;
     aczu_second_font_ = (value & 0x04) >> 2;
     gzu_show_page_ = (value & 0x03) & gzu_size_mask_;
-    
-    // Помечаем экран как требующий обновления.
-    // Полная перерисовка ВСЕГО экрана нужна ТОЛЬКО при смене show_page (младшие
-    // 2 бита) или wide/font/2font (биты 2..4). Смена read_page (биты 6,7)
-    // НЕ требует полной перерисовки — только перерисовка символов, прочитанных
-    // CPU. Доступная страница GZU сама помечает line_update_flags_ в gzu_write().
-    if ((vireg_ & 0x1f) != (value & 0x1f)) {
-        // show_page (биты 0-1) или wide/font/2font (биты 2-4) — изменились.
-        full_redraw_pending_ = true;
+
+    // V-4: при смене страницы ДОСТУПА ГЗУ (биты 6-7) целевой массив
+    // текстового растра меняется — все 1024 знакоместа обязаны
+    // перерисоваться в новый дескриптор страницы (touch-флаги уже
+    // сброшены прошлым рендером). Без этого текст, написанный при одной
+    // странице доступа, «застаревал»/пропадал после переключения.
+    if (gzu_read_page_ != old_read_page) {
+        aczu_char_dirty_.fill(true);
+        aczu_dirty_ = true;
     }
-    
+
+    // Полная перерисовка при смене младших 4 бит: страница отображения
+    // (биты 0-1), шрифт/широкий режим (биты 2-3) — влияют на кадр
+    // целиком (маска 0x0F).
+    if ((vireg_ & 0x0f) != (value & 0x0f)) {
+        full_redraw_pending_ = true;
+        aczu_char_dirty_.fill(true);
+        aczu_dirty_ = true;
+    }
+
     vireg_ = value;
 }
 
@@ -471,31 +421,35 @@ mb_video_state_t Video::get_state() const {
 }
 
 void Video::update_aczu_framebuffer() {
-    // Преобразование символов ACZU в пиксели в 4-й слот GZU
-    // Эталон: ACZU_MakeFrameBuffer() пишет в GZU[scr_Page_Acces]+3
-    // Инкрементальный рендер по позначным dirty-флагам
+    // Преобразование символов ACZU в пиксели в 4-й слот ГЗУ (модель,
+    // побитово совпадающая с растровым выходом АЦЗУ железа: BWV-канал
+    // текста идёт в LUT параллельно ГЗУ и комбинируется в реальном
+    // времени; запись в 4-й байт ГЗУ воспроизводит тот же кадр).
+    // Инкрементальный рендер по позначным dirty-флагам.
     uint8_t* src = aczu_.data();
-    uint8_t* dst = &gzu_planes_[gzu_read_page_][3];  // 4th slot of accessible page
+    uint8_t* dst = &gzu_planes_[gzu_read_page_][3];  // 4-й байт доступной страницы
     bool* touch = aczu_char_dirty_.data();
-    
-    if (!aczu_wide_mode_) { // Normal font mode (64 chars per line, 16 rows)
-        uint8_t* font_ptr = aczu_second_font_ ? &font_[16 * 256] : font_.data();
-        
+
+    // V-3: выбор знакогенератора одинаков в обоих режимах — массив
+    // font_ хранит ДВА набора по 4096 байт (второй — псевдографика,
+    // бит 2 VIREG). Раньше вторая половина массива затиралась «широким
+    // шрифтом» с выходом за границы — UB и мусор вместо псевдографики.
+    uint8_t* font_ptr = aczu_second_font_ ? &font_[16 * 256] : font_.data();
+
+    if (!aczu_wide_mode_) { // Обычный режим (64 символа в строке, 16 строк)
         // Инкрементальный рендер: обновляем только символы с touch=true.
-        // full_redraw_pending_ здесь остался из соображений совместимости с
-        // оригиналом (screen.c:176) — на случай смены show_page, wide/font.
-        // Для типичного кадра в dead-loop меняется 0-2 символа, поэтому пропуск
-        // 1022 символов даёт ×500 ускорение на этом этапе.
+        // Для типичного кадра в dead-loop меняется 0-2 символа, поэтому
+        // пропуск 1022 символов даёт ×500 ускорение на этом этапе.
         for (int scrlen = 1024; scrlen--;) {
             if (*touch || full_redraw_pending_) {
                 uint8_t ch = src[0];
                 uint8_t attr = src[1];
                 uint8_t* chr = font_ptr + ch * 16;
                 uint8_t* chrdst = dst;
-                
+
                 for (int row = 16; row > 0; row--) {
                     *chrdst = (*chr++) ^ attr;
-                    chrdst += 64 * 4;  // Advance to next scanline
+                    chrdst += 64 * 4;  // Переход к следующей строке развёртки
                 }
                 // Помечаем все 16 строк символа как грязные, чтобы render_scanline
                 // перерисовал их при следующем кадре.
@@ -504,36 +458,46 @@ void Video::update_aczu_framebuffer() {
                     if (sym_y + i < 256) line_update_flags_[sym_y + i] = true;
                 }
             }
-            src += 2;      // Next character in ACZU (char + attr)
-            dst += 4;      // Next character position in GZU (4 bytes per char)
-            *touch++ = 0;  // Clear touch flag
+            src += 2;      // Следующий символ в ACZU (символ + атрибут)
+            dst += 4;      // Следующая позиция символа в GZU (4 байта на символ)
+            *touch++ = 0;  // Сброс dirty-флага символа
             
-            if (!(scrlen & 0x3f)) {  // End of screen row (every 64 chars)
-                dst += 15 * 64 * 4;  // Skip to next text row
+            if (!(scrlen & 0x3f)) {  // Конец строки экрана (каждые 64 символа)
+                dst += 15 * 64 * 4;  // Переход к следующей текстовой строке
             }
         }
-    } else { // Wide font mode (32 chars per line, 16 rows)
-        uint8_t* font_ptr = aczu_second_font_ ? &font_[16 * 256 * 2] : &font_[16 * 256];
-        
+    } else { // Широкий режим (32 символа в строке, 16 строк)
+        // Широкий режим растягивает ТОТ ЖЕ шрифт по времени (деление
+        // тактовой VCLK/SHIFT при MODSEL): каждая строка растра символа
+        // занимает 2 байта (16 пикселей). Развёртка бита — табличная
+        // функция от ниббла (WEXPAND, 16 байт — без буфера 16 КБ).
         for (int scrlen = 512; scrlen--;) {
             if (*touch || full_redraw_pending_) {
                 uint8_t ch = src[0];
                 uint8_t attr = src[1];
-                uint8_t* chr = font_ptr + ch * 32;
+                uint8_t* chr = font_ptr + ch * 16;
                 uint8_t* chrdst = dst;
-                
+
                 for (int row = 16; row > 0; row--) {
-                    *chrdst = (*chr++) ^ attr; chrdst += 4;
-                    *chrdst = (*chr++) ^ attr; chrdst += 64 * 4 - 4;
+                    uint8_t b = (*chr++) ^ attr;
+                    *chrdst = WEXPAND[b >> 4]; chrdst += 4;
+                    *chrdst = WEXPAND[b & 0x0F]; chrdst += 64 * 4 - 4;
+                }
+                // V-5: помечаем строки растра и в широком режиме —
+                // раньше dirty-символы не обновляли экран до полной
+                // перерисовки.
+                int sym_y = ((511 - scrlen) >> 5) << 4;
+                for (int i = 0; i < 16; i++) {
+                    if (sym_y + i < 256) line_update_flags_[sym_y + i] = true;
                 }
             }
-            src += 4;      // Wide mode: 4 bytes per character in ACZU
-            dst += 8;      // Wide mode: 8 bytes per character in GZU
+            src += 4;      // Широкий режим: 4 байта на символ в ACZU
+            dst += 8;      // Широкий режим: 8 байт на символ в GZU
             *touch = 0;
-            touch += 2;    // Wide mode: 2 touch flags per character (stride 2)
+            touch += 2;    // Широкий режим: 2 dirty-флага на символ (шаг 2)
             
-            if (!(scrlen & 0x1f)) {  // End of screen row (every 32 chars)
-                dst += 15 * 64 * 4;  // Skip to next text row
+            if (!(scrlen & 0x1f)) {  // Конец строки экрана (каждые 32 символа)
+                dst += 15 * 64 * 4;  // Переход к следующей текстовой строке
             }
         }
     }

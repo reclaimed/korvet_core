@@ -21,7 +21,7 @@
 #include "internal/ppi/ppi.hpp"
 #include "internal/fdc/fdc.hpp"
 #include "internal/serial/serial.hpp"
-#include "internal/lan/lan.hpp"  // Добавлен новый класс LAN
+#include "internal/lan/lan.hpp"
 #include "internal/tape/tape.hpp"
 #include "internal/keyboard/keyboard.hpp"
 #include "internal/mouse/mouse.hpp"
@@ -200,7 +200,7 @@ public:
      * Синхронно: заполняется заново в конце каждого run_frame(), полностью
      * перезаписывая предыдущий кадр. Никакой очереди — если внешний код
      * не забрал буфер до следующего run_frame(), этот кадр звука потерян.
-     * Формат и модель 1:1 с эталонным MakeSound()/SOUNDBUF.
+     * Формат: 441 сэмпл × int16, моно.
      */
     const int16_t* get_audio_frame_buffer() const;
     int get_audio_frame_buffer_size() const;
@@ -249,11 +249,20 @@ public:
      * целиком на стороне внешнего кода (см. Keyboard::key_press). Этот
      * метод лишь честно читает то же самое место, что и BIOS/CP-M сами
      * используют для индикации языка (байт в RAM + бит порта клавиатуры),
-     * тем же способом, что и эталонный эмулятор.
+     * тем же способом, что и индикатор раскладки самого гостя.
      *
      * @return true — QWERTY/латиница активна, false — ЙЦУКЕН/кириллица.
      */
     bool get_keyboard_language_layout() const;
+
+    // =================================================================
+    //  Мышь: режим подключения (выкл / ИРПС / ЭУ8040+ММ8031).
+    //  Ввод — mouse_move()/mouse_set_buttons() в любом режиме; режим
+    //  определяет путь: последовательные посылки Microsoft или счётчики
+    //  ММ8031 на PPI3-B (через мультиплексор ЭУ8040).
+    // =================================================================
+    void mouse_set_mode(mb_mouse_mode_t mode);
+    mb_mouse_mode_t mouse_get_mode() const { return mouse_.get_mode(); }
     
     /**
      * @brief Переместить мышь
@@ -268,20 +277,32 @@ public:
      */
     void mouse_set_buttons(uint8_t buttons);
     
-    /**
-     * @brief Установить значение оси джойстика
-     * @param axis Номер оси
-     * @param value Значение оси
-     */
-    void joystick_set_axis(uint8_t axis, uint8_t value);
-    
-    /**
-     * @brief Установить состояние кнопки джойстика
-     * @param button Номер кнопки
-     * @param pressed true если кнопка нажата, false если отпущена
-     */
+    // =================================================================
+    //  Джойстик МД8030 (через ЭУ8040, слот ХР2): подключения и ввод.
+    //  Направления — PPI3-B биты 0-3, кнопки «Пуск1/Пуск2» — PPI3-A
+    //  биты 4-5 (активный низкий).
+    // =================================================================
+    enum class joystick_direction_t : uint8_t {
+        JOY_UP = 0,
+        JOY_DOWN = 1,
+        JOY_LEFT = 2,
+        JOY_RIGHT = 3
+    };
+    void joystick_set_connected(bool connected);
+    void joystick_set_direction(joystick_direction_t dir, bool active);
     void joystick_set_button(uint8_t button, bool pressed);
     
+    // =================================================================
+    //  Таймер: источник тактирования канала 2 (TMRINT/IRQ5).
+    //  Источники противоречат друг другу в документации (схема:
+    //  HBL с периодом 65,6 мкс; описание элементов: 50 Гц) — по
+    //  умолчанию HBL (по схеме), остальные варианты — опции хоста.
+    // =================================================================
+    void timer_set_channel2_clock(mb_timer_ch2_clock_t source);
+    mb_timer_ch2_clock_t timer_get_channel2_clock() const {
+        return timer_.get_channel2_clock();
+    }
+
     /**
      * @brief Загрузить данные в компоненты (ROM, mapper, шрифт)
      */
@@ -294,7 +315,7 @@ public:
      *
      * Motherboard/Fdc НЕ хранят и не загружают образы дисков сами — они
      * запрашивают конкретные секторы через IFddImageAdapter. "Вставка" и
-     * "извлечение" дискеты — целиком на стороне хоста (gui_qt5 открывает/
+     * "извлечение" дискеты — целиком на стороне хоста (GUI открывает/
      * закрывает файл образа; на RP2040 адаптер читает сектора прямо с
      * SD-карты). См. internal/fdc/fdc_image_adapter.hpp.
      */
@@ -322,8 +343,8 @@ public:
     // =================================================================
     //  Отложенные операции ВГ93 (FDC PendingOp) — для GUI, которому
     //  нужны реалистичные тайминги дискеты (звуки, светодиод, пауза
-    //  BUSY на время позиционирования). mcp_server/bridge этим НЕ
-    //  пользуется и работает в мгновенном (эталонном) режиме.
+    //  BUSY на время позиционирования). CLI-инструменты этим НЕ
+    //  пользуются и работают в мгновенном режиме.
     //  См. internal/fdc/fdc.hpp.
     // =================================================================
     void fdc_set_deferred_ops(bool enable) { fdc_.set_deferred_ops(enable); }
@@ -336,7 +357,7 @@ public:
     }
 
     /**
-     * @brief Подключить приёмник байтов принтера. Хост (gui_qt5) решает,
+     * @brief Подключить приёмник байтов принтера. Хост решает,
      * писать ли в TXT/PDF или на физический принтер — korvet_core сам
      * файлов не открывает. См. internal/printer/printer.hpp.
      */
@@ -377,23 +398,58 @@ public:
     /**
      * @brief Подключить приёмник байтов LAN-порта — так же, как RS232,
      * это просто побайтовый поток, упаковку в кадры/пакеты делает хост.
+     * Семантика общей линии (party line): каждый переданный байт
+     * доставляется всем станциям, включая отправителя.
      */
     void lan_set_byte_out_callback(LanByteOutCallback cb);
 
     /**
-     * @brief Байт, пришедший ОТ хоста по LAN — кладётся в приёмный буфер.
+     * @brief Байт, пришедший ОТ хоста по LAN — кладётся в приёмный
+     * буфер; при включённом приёме поднимается LANINT (IRQ3).
      */
     void lan_inject_byte(uint8_t byte);
-    
+
     /**
-     * @brief Вставить кассету в магнитофон (из буфера)
+     * @brief Адрес рабочего места ЛВС (1-15; 0 — групповой).
+     * Отражается в LANADR (PPI1-A биты 4-7).
      */
-    bool tape_insert_buffer(const uint8_t* data, size_t size);
-    
-    /**
-     * @brief Извлечь кассету из магнитофона
-     */
-    bool tape_eject();
+    void lan_set_address(uint8_t addr) { lan_.set_address(addr); }
+    uint8_t lan_get_address() const { return lan_.get_address(); }
+
+    // =================================================================
+    //  Адаптер магнитофона: однобитовый канал, привязанный к тактам CPU.
+    //  Формат «кассеты» (полупериоды в тактах) конвертирует хост —
+    //  ядро не знает ни TAP, ни WAV; модуляцию/блоки разбирает гостевое
+    //  ПО (адаптер «тупой» по описанию элементов).
+    // =================================================================
+
+    /// Вставить «кассету»: начальный уровень + полупериоды (такты CPU).
+    /// Единица времени — такты CPU (CPU_CLK тактов/с); хост переводит
+    /// секунды в такты сам (перемотка/турбо учитываются автоматически).
+    void tape_set_input(uint8_t initial_level,
+                        const uint32_t* half_period_cycles, size_t count);
+
+    /// Потоковое добавление полупериодов (line-in в реальном времени).
+    void tape_input_append(const uint32_t* half_period_cycles, size_t count);
+
+    /// Перемотка входного потока в начало.
+    void tape_input_rewind();
+
+    /// Есть ли входные данные (кассета «вставлена»).
+    bool tape_is_input_available() const { return tape_.is_input_available(); }
+
+    /// Подключить приёмник событий записи: (уровень 0/1/2, такт CPU).
+    /// Уровни: SETLOW=00B→0, SETMID=01B→1, SETHIGH=11B→2 (PPI2-C биты 0-1).
+    void tape_set_out_callback(TapeOutCallback cb);
+
+    /// Подключить приёмник событий реле «кратковременного стопа» (бит 2).
+    void tape_set_relay_callback(TapeRelayCallback cb);
+
+    /// Состояние реле стопа (для иконки UI).
+    bool tape_is_stop_relay() const { return tape_.is_stop_relay(); }
+
+    /// Виртуальная позиция ленты (такты CPU, без пауз реле).
+    uint64_t tape_get_position() const { return tape_.get_tape_position(); }
     
     /**
      * @brief Получить текущее состояние CPU
@@ -422,6 +478,17 @@ public:
     // Доступ к состоянию только для чтения
     uint8_t* readout_ram() { return memory_.get_ram(); }
     
+    /**
+     * @brief Отрендерить текущий видеокадр (вызывает хост после
+     * run_frame — ядро само не знает, когда кадр «нужен» GUI).
+     * После вызова кадр доступен через readout_video() (индексные цвета
+     * 0-15, 512×256) и get_front_framebuffer() (zero-copy shared_ptr).
+     */
+    void render_video_frame() {
+        video_.render_frame(nullptr);
+        video_.swap_frame_buffers();
+    }
+
     /**
      * @brief Получить доступ к видео-буферу для чтения
      * @return Указатель на буфер кадра
